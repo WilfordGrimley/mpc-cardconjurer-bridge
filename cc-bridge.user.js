@@ -627,20 +627,24 @@
 
     const data = { name: name };
 
-    // data-card-set-code / data-card-collector-number aren't part of
-    // CLAUDE.md's original four attributes (data-card-name,
-    // data-card-identifier, data-source-key, data-card-type) — that list never
-    // specified how set/collector info would be exposed. Named here to match
-    // the postMessage payload shape directly; adjust if the upstream
-    // the site contract lands with different attribute names.
+    // data-card-set-code / data-card-collector-number: not part of the DOM
+    // API the site actually shipped (data-card-name, data-card-identifier,
+    // data-source-key, data-card-dpi, data-card-type) — requested as a
+    // follow-up addition, matching its documented DOM API's own documented forward-compat
+    // plan ("the card's resolved printing set/collector number"). Named here
+    // to match the postMessage payload shape directly; harmless no-op until
+    // that lands.
     const setCode = rootEl.getAttribute('data-card-set-code');
     if (setCode) data.set_code = setCode;
 
     const collectorNumber = rootEl.getAttribute('data-card-collector-number');
     if (collectorNumber) data.collector_number = collectorNumber;
 
-    const frameHint = rootEl.getAttribute('data-card-type');
-    if (frameHint) data.frame_hint = frameHint;
+    // No frame_hint here: data-card-type turned out to mean "card" /
+    // "cardback" / "token" (the MPC element category) once the real DOM API
+    // shipped, not a Magic frame/layout hint — sending it through as
+    // frame_hint would be actively misleading, and nothing downstream reads
+    // frame_hint yet regardless.
 
     return data;
   }
@@ -653,14 +657,25 @@
     return el ? el.getAttribute(attr) || '' : '';
   }
 
-  // Forward-compat: if a host site ever dispatches this event (per the
-  // ecosystem's semantic-attribute contract), merge its detail into
-  // whatever the clicked card's root element already carries as attributes.
-  // No-op today; costs nothing to keep in place for when it isn't.
+  // mpc:card-selected is real now (an earlier commit), firing with
+  // a camelCase detail: {name, identifier, sourceKey, dpi, cardType}. Only
+  // name overlaps today's payload fields; set_code/collector_number aren't
+  // in the event yet either (requested as a follow-up, matching its documented DOM API's
+  // own forward-compat plan), mapped explicitly here — not a blind
+  // Object.assign — so this is correct as soon as they land instead of
+  // silently merging camelCase keys the payload builder never reads.
   let lastCardSelectedDetail = null;
   document.addEventListener('mpc:card-selected', function (event) {
     lastCardSelectedDetail = event && event.detail ? event.detail : null;
   });
+
+  function mergeCardSelectedDetail(cardData, detail) {
+    const merged = Object.assign({}, cardData);
+    if (detail.name) merged.name = detail.name;
+    if (detail.setCode) merged.set_code = detail.setCode;
+    if (detail.collectorNumber) merged.collector_number = detail.collectorNumber;
+    return merged;
+  }
 
   // ---- button injection ----------------------------------------------
 
@@ -701,7 +716,7 @@
     if (!cardData) return;
 
     if (lastCardSelectedDetail && lastCardSelectedDetail.name) {
-      cardData = Object.assign({}, cardData, lastCardSelectedDetail);
+      cardData = mergeCardSelectedDetail(cardData, lastCardSelectedDetail);
     }
 
     openEditorModal(cardData);
