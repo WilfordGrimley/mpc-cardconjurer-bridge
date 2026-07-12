@@ -8,10 +8,20 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_getResourceURL
 // @grant        unsafeWindow
+// @resource     ultramixModel https://raw.githubusercontent.com/WilfordGrimley/mpc-cardconjurer-bridge/3846cf7c803d320144ebf948f36f459e924beda8/models/4x-UltraMix_Balanced.onnx
 // @run-at       document-idle
 // @license      MIT
 // ==/UserScript==
+
+// The @resource above is Kim2091's Ultramix (Balanced) upscaler, converted
+// to ONNX from https://huggingface.co/Kim2091/UltraSharp (Interpolations/
+// 4x-UltraMix_Balanced.pth) — CC-BY-NC-SA-4.0, non-commercial. It's the
+// bundled default for the Enlarger upscale pass (see getUpscaleModelUrl/
+// isBundledUltramixEnabled below); this project's own code stays MIT, but
+// this one bundled asset carries Kim2091's license terms. See
+// THIRD_PARTY_NOTICES.md.
 
 // NOTE on @match: this is intentionally broad. Tampermonkey/Violentmonkey only
 // ever run a script on origins covered by @match, so the "enable this site"
@@ -124,20 +134,46 @@
     return !GM_getValue('driveClientId', '') && !!DEFAULT_DRIVE_CLIENT_ID;
   }
 
-  // Optional: a URL to the user's own ONNX super-resolution model weights
-  // (e.g. a Real-ESRGAN export), passed through to the Enlarger tool at
-  // handoff time so it can run real neural upscaling instead of its
-  // built-in classical (Lanczos) resampling fallback. Empty means
-  // Enlarger uses its own default/fallback behavior. Not a Tampermonkey
-  // file picker — GM storage isn't meant for tens-to-hundreds of MB model
-  // files — a URL the user hosts themselves (their own instance, same
-  // "bring your own" pattern as everything else configurable here).
+  // Optional: a URL to the user's own ONNX super-resolution model weights,
+  // passed through to the Enlarger tool at handoff time so it can run real
+  // neural upscaling instead of its built-in classical (Lanczos) resampling
+  // fallback. Overrides the bundled Ultramix model entirely when set. Empty
+  // means fall through to the bundled default (see resolveUpscaleModelUrl).
   function getUpscaleModelUrl() {
     return GM_getValue('upscaleModelUrl', '');
   }
 
   function setUpscaleModelUrl(url) {
     GM_setValue('upscaleModelUrl', url);
+  }
+
+  // Whether to use the bundled Ultramix (Balanced) model — see the
+  // @resource block/comment at the top of this file — as the default
+  // upscaler when the user hasn't configured their own model URL. Kim2091's
+  // model, CC-BY-NC-SA-4.0/non-commercial; on by default since it's what
+  // ships with the script, but a user who doesn't want any non-commercial
+  // asset engaged at all can turn it off and fall back to classical resize.
+  function isBundledUltramixEnabled() {
+    return GM_getValue('useBundledUltramix', true);
+  }
+
+  function setBundledUltramixEnabled(enabled) {
+    GM_setValue('useBundledUltramix', enabled);
+  }
+
+  // The user's own configured model always wins; otherwise the bundled
+  // Ultramix resource if enabled and actually available (GM_getResourceURL
+  // throws if the @resource failed to fetch/isn't declared); otherwise
+  // empty, which means Enlarger's classical-resize fallback runs.
+  function resolveUpscaleModelUrl() {
+    const custom = getUpscaleModelUrl();
+    if (custom) return custom;
+    if (!isBundledUltramixEnabled()) return '';
+    try {
+      return GM_getResourceURL('ultramixModel') || '';
+    } catch (e) {
+      return '';
+    }
   }
 
   function getEnabledOrigins() {
@@ -226,15 +262,31 @@
   GM_registerMenuCommand('Configure upscale model weights (for Enlarger)', function () {
     const current = getUpscaleModelUrl();
     const input = prompt(
-      'URL to your own ONNX super-resolution model (e.g. a Real-ESRGAN export) for the Enlarger tool to use ' +
-        'instead of its built-in classical resampling. Must be reachable with CORS enabled from wherever you ' +
-        'host Enlarger. Leave blank to use Enlarger\'s own built-in fallback:',
+      'URL to your own ONNX super-resolution model for the Enlarger tool to use instead of the bundled ' +
+        'default. The bundled default (used when this is blank) is Ultramix (Balanced) by Kim2091 — ' +
+        'ESRGAN/RRDBNet, CC-BY-NC-SA-4.0/non-commercial, native 4x scale, RGB, 0-1 normalized — see ' +
+        'THIRD_PARTY_NOTICES.md. A custom URL here fully replaces it and must be reachable with CORS ' +
+        'enabled from wherever you host Enlarger. Leave blank to use the bundled Ultramix model (or ' +
+        'classical resize, if you\'ve disabled that via the other upscale menu command):',
       current
     );
     if (input === null) return;
     setUpscaleModelUrl(input.trim());
-    alert('cc-bridge: upscale model URL ' + (input.trim() ? 'saved.' : 'cleared — back to Enlarger\'s built-in fallback.'));
+    alert('cc-bridge: upscale model URL ' + (input.trim() ? 'saved.' : 'cleared — back to the bundled Ultramix default.'));
   });
+
+  GM_registerMenuCommand(
+    (isBundledUltramixEnabled() ? 'Disable' : 'Enable') + ' bundled Ultramix upscaling (non-commercial)',
+    function () {
+      const next = !isBundledUltramixEnabled();
+      setBundledUltramixEnabled(next);
+      alert(
+        next
+          ? 'cc-bridge: bundled Ultramix upscaling enabled — used automatically unless you\'ve set a custom model URL.'
+          : 'cc-bridge: bundled Ultramix upscaling disabled — Enlarger falls back to classical resize unless you\'ve set a custom model URL.'
+      );
+    }
+  );
 
   // ---- Card Conjurer receiver -------------------------------------------
   //
@@ -1831,10 +1883,15 @@
         canvas.getContext('2d').drawImage(img, 0, 0);
 
         if (data.modelUrl) {
-          return runCustomModel(canvas, data, scaleFactor).catch(function () {
+          return runCustomModel(canvas, data, scaleFactor).catch(function (err) {
             // Any failure in the custom-model path (bad shape, CORS,
-            // network, wrong tensor layout) falls back to the built-in
-            // resampler rather than producing nothing.
+            // network, wrong tensor layout, a blob: model URL the iframe
+            // couldn't fetch) falls back to the built-in resampler rather
+            // than producing nothing -- but do it loudly, since this is
+            // now the default path for every install and a silent
+            // degrade-to-Lanczos looks identical to a successful upscale
+            // from the output alone.
+            console.warn('Enlarger: model-based upscale failed, falling back to classical resize:', err);
             return runBuiltin(canvas, scaleFactor);
           });
         }
@@ -1899,12 +1956,13 @@
   }
 
   // ---------------------------------------------------------------------
-  // Real, working upscaling: separable Lanczos-3 resample + light unsharp
-  // mask. Deterministic classical signal processing, not a trained
-  // super-resolution model — it sharpens what's already in the source, it
-  // doesn't invent detail the way a real model (Real-ESRGAN etc., via the
-  // optional custom-model path above) can. This is the fallback and
-  // default; see runCustomModel for the model path.
+  // Classical fallback: separable Lanczos-3 resample + light unsharp mask.
+  // Deterministic signal processing, not a trained super-resolution model
+  // — it sharpens what's already in the source, it doesn't invent detail
+  // the way the bundled Ultramix model (via runCustomModel below) can.
+  // Runs when there's no resolved model URL at all — the user disabled
+  // the bundled default and hasn't set a custom one, or the model
+  // resource/URL failed to load. See runCustomModel for the model path.
   // ---------------------------------------------------------------------
   function lanczosKernel(x, a) {
     if (x === 0) return 1;
@@ -1999,18 +2057,22 @@
   }
 
   // ---------------------------------------------------------------------
-  // Optional custom ONNX model path. Loaded lazily, only when the handoff
-  // message actually includes a modelUrl. onnxruntime-web is fetched from
-  // a CDN, which needs real network access from wherever this ends up
-  // running (fine once embedded in a real userscript on a real page; the
-  // one thing that never worked was Claude's own sandboxed Artifact
-  // preview, which blocks all external requests by design).
+  // ONNX model path — bundled Ultramix by default, or the user's own
+  // configured model (see resolveUpscaleModelUrl in cc-bridge.user.js).
+  // Loaded lazily, only when the handoff message actually includes a
+  // modelUrl. onnxruntime-web is fetched from a CDN, which needs real
+  // network access from wherever this ends up running (fine once embedded
+  // in a real userscript on a real page; the one thing that never worked
+  // was Claude's own sandboxed Artifact preview, which blocks all external
+  // requests by design).
   //
-  // Tensor-shape assumptions below match a typical Real-ESRGAN ONNX
-  // export (NCHW, float32, 0..1 normalized, fixed native scale factor) —
-  // overridable via the handoff message's tileSize/tileOverlap/
-  // channelOrder/modelScale fields since not every export matches
-  // exactly.
+  // Tensor-shape assumptions below match Ultramix (Kim2091's
+  // ESRGAN/RRDBNet-family upscaler, CC-BY-NC-SA-4.0/non-commercial) as
+  // exported to ONNX: NCHW, float32, 0..1 normalized, RGB channel order,
+  // native 4x scale — the same layout standard ESRGAN-family exports use
+  // generally. Overridable via the handoff message's tileSize/
+  // tileOverlap/channelOrder/modelScale fields since not every export
+  // matches exactly.
   // ---------------------------------------------------------------------
   const ORT_CDN_URL = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/ort.min.js';
 
@@ -2151,6 +2213,13 @@
         const payload = { type: 'enlarger-load', scale: 2 };
         if (isDataUrl) payload.dataUrl = dataUrlOrUrl;
         else payload.url = dataUrlOrUrl;
+        // Bundled Ultramix by default, the user's own configured model if
+        // they've set one, or omitted entirely (classical-resize fallback)
+        // — see resolveUpscaleModelUrl. This was previously never wired
+        // through at all, so runCustomModel's ONNX path was unreachable
+        // regardless of configuration.
+        const modelUrl = resolveUpscaleModelUrl();
+        if (modelUrl) payload.modelUrl = modelUrl;
         iframe.contentWindow.postMessage(payload, enlargerOrigin);
       });
 
