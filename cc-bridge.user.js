@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.15.0
+// @version      0.16.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -54,6 +54,7 @@
   ];
   const CARD_ROOT_SELECTOR = '[data-card-name], .mpccard';
   const BUTTON_CLASS = 'cc-bridge-btn';
+  const BUTTON_ANCHOR_CLASS = 'cc-bridge-btn-anchor';
   const INJECTED_MARKER_ATTR = 'data-cc-bridge-injected';
   const RETRY_INTERVAL_MS = 250;
   const MAX_RETRIES = 20; // 250ms * 20 = 5s
@@ -1359,8 +1360,14 @@
     '  background: #4c9be8;' +
     '  color: #ebebeb;' +
     '  cursor: pointer;' +
+    '  opacity: 0;' +
+    '  transition: opacity 0.12s ease;' +
     '}' +
     '.' + BUTTON_CLASS + ':hover { background: #3d8cd9; }' +
+    // Shown only while hovering the card art itself (the button's
+    // positioned parent, see BUTTON_ANCHOR_CLASS in injectButtonIfNeeded)
+    // rather than always-on, so it doesn't clutter the grid.
+    '.' + BUTTON_ANCHOR_CLASS + ':hover > .' + BUTTON_CLASS + ' { opacity: 1; }' +
     '.cc-bridge-modal-backdrop {' +
     '  position: fixed; inset: 0; background: rgba(15,37,55,0.75);' +
     '  z-index: 999999;' +
@@ -1899,16 +1906,32 @@
     if (rootEl.hasAttribute(INJECTED_MARKER_ATTR)) return;
     if (!extractCardData(rootEl)) return;
 
-    const computedPosition = getComputedStyle(rootEl).position;
+    // Anchor to the art's own box (img.card-img's parent), not to rootEl
+    // itself — rootEl is whatever CARD_ROOT_SELECTOR matched, which on a
+    // card grid tile is the *whole* tile (header + art + name footer) and
+    // on ProxyPrints'/mpcfill's card-details modal is the entire
+    // viewport-covering modal element. Anchoring to rootEl in either case
+    // puts the button somewhere other than on the card art (grid: up in
+    // the header strip; details modal: pinned to a corner of the browser
+    // viewport, effectively unclickable). img.card-img's immediate parent
+    // is the tight, already-positioned box around just the art in both
+    // layouts, since both reuse the same image component. Falls back to
+    // rootEl if the art hasn't rendered yet — a self-correcting cosmetic
+    // edge case, not worth extra re-anchoring logic for.
+    const artImg = rootEl.querySelector('img.card-img');
+    const anchorEl = (artImg && artImg.parentElement) || rootEl;
+
+    const computedPosition = getComputedStyle(anchorEl).position;
     if (computedPosition === 'static') {
-      rootEl.style.position = 'relative';
+      anchorEl.style.position = 'relative';
     }
+    anchorEl.classList.add(BUTTON_ANCHOR_CLASS);
 
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = BUTTON_CLASS;
     btn.textContent = '+ conjure';
-    rootEl.appendChild(btn);
+    anchorEl.appendChild(btn);
     rootEl.setAttribute(INJECTED_MARKER_ATTR, '1');
   }
 
