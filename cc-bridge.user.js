@@ -62,6 +62,15 @@
   // on the site behaves (border/label static, only the art scales) —
   // the button should scale along with it there instead of staying put.
   const BUTTON_ANCHOR_ZOOM_CLASS = 'cc-bridge-btn-anchor-zoom';
+  // Wraps the trigger in the zoom case (see createConjureTrigger) — sized
+  // to exactly match the art image's own box, as a *sibling* of it (never
+  // the img itself, which can't have children, and never anchorEl, which
+  // already contains the img and has its own separate scale rule — see
+  // the comment in createConjureTrigger for why that'd double-scale it).
+  // Scaling this congruent, independent wrapper in lockstep with the art
+  // makes the trigger track the art's actual moving corner, not just grow
+  // in place near it.
+  const BUTTON_TETHER_CLASS = 'cc-bridge-btn-tether';
   const INJECTED_MARKER_ATTR = 'data-cc-bridge-injected';
   const RETRY_INTERVAL_MS = 250;
   const MAX_RETRIES = 20; // 250ms * 20 = 5s
@@ -1538,22 +1547,30 @@
     '  color: #ebebeb;' +
     '  cursor: pointer;' +
     '  opacity: 0;' +
-    // transform's own timing (0.15s ease-out) matches ZoomableThumbnail's
-    // img transition exactly (see BUTTON_ANCHOR_ZOOM_CLASS below), so the
-    // two visually stay in lockstep during the hover-zoom.
-    '  transition: opacity 0.12s ease, transform 0.15s ease-out;' +
+    '  pointer-events: auto;' + // carves an exception out of BUTTON_TETHER_CLASS's pointer-events: none, below
+    '  transition: opacity 0.12s ease;' +
     '}' +
     '.' + BUTTON_CLASS + ':hover { background: #3d8cd9; }' +
     // Shown only while hovering the card art itself (the button's
-    // positioned parent, see BUTTON_ANCHOR_CLASS in injectButtonIfNeeded)
-    // rather than always-on, so it doesn't clutter the grid.
-    '.' + BUTTON_ANCHOR_CLASS + ':hover > .' + BUTTON_CLASS + ' { opacity: 1; }' +
+    // positioned parent, see BUTTON_ANCHOR_CLASS in injectButtonIfNeeded).
+    // Descendant (not direct-child) combinator since the button may live
+    // one level deeper, inside BUTTON_TETHER_CLASS's wrapper — see there.
+    '.' + BUTTON_ANCHOR_CLASS + ':hover .' + BUTTON_CLASS + ' { opacity: 1; }' +
+    // Sized/positioned to exactly match the art's own box (see
+    // BUTTON_TETHER_CLASS's declaration for why this has to be a separate
+    // element rather than scaling the button or anchorEl directly).
+    '.' + BUTTON_TETHER_CLASS + ' {' +
+    '  position: absolute; inset: 0; pointer-events: none;' +
+    // Timing matches ZoomableThumbnail's own img transition exactly, so
+    // the two move in lockstep during the hover-zoom.
+    '  transition: transform 0.15s ease-out;' +
+    '}' +
     // Everywhere else on the site, a card's border/label stay static
     // while only its art zooms on hover — but ProxyPrints' printing-tag
     // candidates (ZoomableThumbnail, `:hover img { transform: scale(1.6) }`)
-    // are a deliberate exception, so the button matches that exception
+    // are a deliberate exception, so the trigger matches that exception
     // here rather than the site-wide norm.
-    '.' + BUTTON_ANCHOR_ZOOM_CLASS + ':hover > .' + BUTTON_CLASS + ' { transform: scale(1.6); }' +
+    '.' + BUTTON_ANCHOR_ZOOM_CLASS + ':hover > .' + BUTTON_TETHER_CLASS + ' { transform: scale(1.6); }' +
     '.cc-bridge-modal-backdrop {' +
     '  position: fixed; inset: 0; background: rgba(15,37,55,0.75);' +
     '  z-index: 999999;' +
@@ -2180,11 +2197,15 @@
   // applies) and still caught by the delegated click handler below, which
   // matches by class, not tag; only needs keyboard activation added by
   // hand, since a real <button> gets that for free.
-  function createConjureTrigger(anchorEl) {
+  // Returns the element to append to anchorEl: either the trigger itself,
+  // or (when it needs the tether-wrapper treatment) a wrapper containing
+  // it. artImg is the actual art <img> anchorEl was built around, if any
+  // (see injectButtonIfNeeded) — undefined when anchorEl fell back to
+  // rootEl because no art was found.
+  function createConjureTrigger(anchorEl, artImg) {
     const mustAvoidNesting = !!anchorEl.closest('button, a');
     const btn = document.createElement(mustAvoidNesting ? 'span' : 'button');
     if (mustAvoidNesting) {
-      anchorEl.classList.add(BUTTON_ANCHOR_ZOOM_CLASS);
       btn.setAttribute('role', 'button');
       btn.setAttribute('tabindex', '0');
       btn.addEventListener('keydown', function (event) {
@@ -2211,7 +2232,14 @@
     }
     btn.className = BUTTON_CLASS;
     btn.textContent = '+ conjure';
-    return btn;
+
+    if (!mustAvoidNesting || !artImg) return btn;
+
+    anchorEl.classList.add(BUTTON_ANCHOR_ZOOM_CLASS);
+    const wrapper = document.createElement('span');
+    wrapper.className = BUTTON_TETHER_CLASS;
+    wrapper.appendChild(btn);
+    return wrapper;
   }
 
   function injectButtonIfNeeded(rootEl) {
@@ -2221,18 +2249,23 @@
     }
     if (!extractCardData(rootEl)) return;
 
-    // Anchor to the art's own box (img.card-img's parent), not rootEl —
+    // Anchor to the art's own box (the art <img>'s parent), not rootEl —
     // rootEl is whatever CARD_ROOT_SELECTOR matched, which on a grid tile
-    // is the *whole* tile (header + art + name footer) and on MPC
-    // Autofill's card-details modal is the entire viewport-covering modal.
-    // The art's box (`.ratio-7x5` in the upstream/fork source) is sized to
-    // the real card's own proportions (`padding-bottom: 139.6825%`, i.e.
-    // 88mm/63mm) with `overflow: hidden`, so it — not the raw <img>, which
-    // is deliberately scaled ~9% past it to preview bleed and then
-    // clipped — is exactly the card's visible boundary. Falls back to
-    // rootEl if the art hasn't rendered yet (`loading="lazy"`); see
-    // upgradeButtonAnchor above for how that gets corrected once it has.
-    const artImg = rootEl.querySelector('img.card-img');
+    // is the *whole* tile (header + art + name footer), on MPC Autofill's
+    // card-details modal is the entire viewport-covering modal, and on
+    // ProxyPrints' printing-tag candidates is the candidate's own vote
+    // <button>. The art's box (`.ratio-7x5` in the upstream/fork source,
+    // or ZoomableThumbnail for printing-tag candidates) is sized to the
+    // art's own real proportions, so it — not the raw <img>, which e.g. on
+    // the normal grid/details view is deliberately scaled ~9% past it to
+    // preview bleed and then clipped — is exactly the art's visible
+    // boundary. `img.card-img` covers the grid/details case; the plain
+    // `img` fallback covers cases with no class hook, like the printing-tag
+    // candidates. Falls back to rootEl if no art is found at all (e.g. it
+    // hasn't rendered yet, `loading="lazy"`, or there genuinely isn't one —
+    // ProxyPrints' "No match" candidate button); see upgradeButtonAnchor
+    // above for how the lazy-load case gets corrected once art appears.
+    const artImg = rootEl.querySelector('img.card-img') || rootEl.querySelector('img');
     const anchorEl = (artImg && artImg.parentElement) || rootEl;
 
     const computedPosition = getComputedStyle(anchorEl).position;
@@ -2241,8 +2274,8 @@
     }
     anchorEl.classList.add(BUTTON_ANCHOR_CLASS);
 
-    const btn = createConjureTrigger(anchorEl);
-    anchorEl.appendChild(btn);
+    const trigger = createConjureTrigger(anchorEl, artImg);
+    anchorEl.appendChild(trigger);
     rootEl.setAttribute(INJECTED_MARKER_ATTR, '1');
   }
 
