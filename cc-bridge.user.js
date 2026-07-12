@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.13.0
+// @version      0.14.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -1284,7 +1284,36 @@
     '  color: #ebebeb; font-size: 12px; padding: 9px 12px; cursor: pointer;' +
     '}' +
     '.cc-bridge-art-popover-opt:last-child { border-bottom: none; }' +
-    '.cc-bridge-art-popover-opt:hover { background: #4c9be8; color: #1c0d07; }';
+    '.cc-bridge-art-popover-opt:hover { background: #4c9be8; color: #1c0d07; }' +
+    '.cc-bridge-queue-panel {' +
+    '  position: fixed; z-index: 1000000; width: 260px; max-height: 320px; overflow-y: auto;' +
+    '  background: #0f2537; border: 1px solid #20374c; border-radius: 2px;' +
+    '  box-shadow: 0 6px 20px rgba(0,0,0,0.4);' +
+    '}' +
+    '.cc-bridge-queue-empty {' +
+    '  padding: 14px 12px; font-size: 12px; color: #abb6c2; line-height: 1.5;' +
+    '}' +
+    '.cc-bridge-queue-row {' +
+    '  display: flex; align-items: center; gap: 6px; padding: 9px 10px;' +
+    '  border-bottom: 1px solid #20374c; font-size: 12px; color: #ebebeb;' +
+    '}' +
+    '.cc-bridge-queue-row:last-child { border-bottom: none; }' +
+    '.cc-bridge-queue-row-clickable { cursor: pointer; }' +
+    '.cc-bridge-queue-row-clickable:hover { background: #1c3348; }' +
+    '.cc-bridge-queue-row-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }' +
+    '.cc-bridge-queue-row-status {' +
+    '  font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;' +
+    '  padding: 2px 6px; border-radius: 2px; flex: none;' +
+    '}' +
+    '.cc-bridge-queue-status-queued { color: #abb6c2; background: #20374c; }' +
+    '.cc-bridge-queue-status-processing { color: #1c0d07; background: #4c9be8; }' +
+    '.cc-bridge-queue-status-ready { color: #0f2537; background: #8fd6c0; }' +
+    '.cc-bridge-queue-status-failed { color: #ebebeb; background: #b3432f; }' +
+    '.cc-bridge-queue-row-remove {' +
+    '  background: transparent; border: none; color: #6f6259; font-size: 14px;' +
+    '  line-height: 1; padding: 0 2px; cursor: pointer; flex: none;' +
+    '}' +
+    '.cc-bridge-queue-row-remove:hover { color: #ebebeb; }';
   document.documentElement.appendChild(style);
 
   // ---- card data extraction ------------------------------------------
@@ -1774,6 +1803,11 @@
     for (let i = 0; i < roots.length; i++) {
       injectButtonIfNeeded(roots[i]);
     }
+    // Cheap no-op once already present (guarded at the top of the
+    // function) — piggybacks on the same rescan trigger as card scanning
+    // so it retries opportunistically until the nav actually exists,
+    // without a separate observer.
+    injectQueueNavTab();
   }
 
   // ---- Google Drive export (upload half, runs on this host page) --------
@@ -1976,6 +2010,115 @@
     showArtSourcePopover(btn, cardData, rootEl, rootEl.getBoundingClientRect());
   });
 
+  // ---- background upscale queue ------------------------------------------
+  //
+  // In-memory, not GM_setValue — GM storage is JSON-only and can't hold a
+  // Blob (the actual upscaled result), and the scope this is built for
+  // (host page stays open while working through a batch of cards) doesn't
+  // need survival across a full reload/tab close, only across multiple
+  // "+ conjure" clicks within the same page session, which a plain array
+  // handles fine.
+  let upscaleQueue = [];
+  let queueListeners = [];
+
+  function addQueueJob(cardData, originRect) {
+    const job = {
+      id: 'q' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+      cardName: cardData.name,
+      status: 'queued', // 'queued' | 'processing' | 'ready' | 'failed'
+      cardData: cardData,
+      originRect: originRect,
+      resultBlob: null,
+      createdAt: Date.now(),
+    };
+    upscaleQueue.push(job);
+    notifyQueueChanged();
+    return job;
+  }
+
+  function updateQueueJob(id, patch) {
+    const job = upscaleQueue.find(function (j) { return j.id === id; });
+    if (!job) return null;
+    Object.assign(job, patch);
+    notifyQueueChanged();
+    return job;
+  }
+
+  function removeQueueJob(id) {
+    const idx = upscaleQueue.findIndex(function (j) { return j.id === id; });
+    if (idx !== -1) upscaleQueue.splice(idx, 1);
+    notifyQueueChanged();
+  }
+
+  function notifyQueueChanged() {
+    queueListeners.forEach(function (fn) {
+      fn(upscaleQueue);
+    });
+  }
+
+  // Marks a job ready (resultBlobOrFile may be null — the upscale pass
+  // didn't come through, or there was nothing to upscale — Card Conjurer
+  // still opens fine either way, just without a custom art override) and
+  // raises the toast notification. The job itself stays in the queue list
+  // regardless of whether the toast gets dismissed or times out, so
+  // "summon it themselves" from the queue tab always works even if they
+  // miss the toast.
+  function finishQueueJob(job, resultBlobOrFile) {
+    updateQueueJob(job.id, { status: 'ready', resultBlob: resultBlobOrFile || null });
+    showQueueReadyToast(job);
+  }
+
+  function showQueueReadyToast(job) {
+    let container = document.querySelector('.cc-bridge-toast-stack');
+    if (!container) {
+      const style = document.createElement('style');
+      style.textContent =
+        '.cc-bridge-toast-stack {' +
+        '  position: fixed; bottom: 16px; right: 16px; z-index: 999999;' +
+        '  display: flex; flex-direction: column-reverse; gap: 8px; align-items: flex-end;' +
+        '}' +
+        '.cc-bridge-ready-toast {' +
+        '  font-size: 13px; padding: 10px 14px; border-radius: 2px; cursor: pointer;' +
+        '  color: #ebebeb; background: #4c9be8; max-width: 280px;' +
+        '  box-shadow: 0 4px 16px rgba(0,0,0,0.4); border: none; text-align: left;' +
+        '  font-family: inherit;' +
+        '}' +
+        '.cc-bridge-ready-toast:hover { background: #3d8cd9; }' +
+        '.cc-bridge-ready-toast .cc-bridge-toast-sub { display: block; font-size: 11px; opacity: 0.85; margin-top: 2px; }';
+      document.documentElement.appendChild(style);
+      container = document.createElement('div');
+      container.className = 'cc-bridge-toast-stack';
+      document.body.appendChild(container);
+    }
+
+    const toast = document.createElement('button');
+    toast.type = 'button';
+    toast.className = 'cc-bridge-ready-toast';
+
+    const strong = document.createElement('strong');
+    strong.textContent = job.cardName;
+    toast.appendChild(strong);
+    toast.appendChild(document.createTextNode(' is ready for Card Conjurer.'));
+
+    const sub = document.createElement('span');
+    sub.className = 'cc-bridge-toast-sub';
+    sub.textContent = 'Click to open';
+    toast.appendChild(sub);
+
+    toast.addEventListener('click', function () {
+      toast.remove();
+      openEditorModal(job.cardData, job.originRect, job.resultBlob);
+    });
+    container.appendChild(toast);
+
+    // Auto-dismiss the toast itself after a while so they don't pile up —
+    // the job stays in the queue tab (#2) regardless, so nothing is lost
+    // by missing it, just the quick-click shortcut.
+    setTimeout(function () {
+      if (toast.parentNode) toast.remove();
+    }, 12000);
+  }
+
   // ---- art source choice (Scryfall vs. the user's own upload) -----------
   //
   // Card Conjurer's own import already fetches Scryfall's art
@@ -2022,14 +2165,14 @@
     scryfallOpt.addEventListener('click', function () {
       closeArtSourcePopover();
       const artUrl = extractCardArtUrl(rootEl);
+      const job = addQueueJob(cardData, originRect);
       if (!artUrl) {
-        openEditorModal(cardData, originRect);
+        finishQueueJob(job, null);
         return;
       }
-      showDriveToast('Upscaling art…');
+      updateQueueJob(job.id, { status: 'processing' });
       upscaleViaEnlarger({ url: artUrl }, function (blob) {
-        showDriveToast(blob ? 'Upscaled — opening Card Conjurer.' : 'Upscale unavailable — using Scryfall art as-is.');
-        openEditorModal(cardData, originRect, blob);
+        finishQueueJob(job, blob);
       });
     });
 
@@ -2048,13 +2191,13 @@
         const file = fileInput.files[0];
         fileInput.remove();
         if (!file) return;
-        showDriveToast('Upscaling your image…');
+        const job = addQueueJob(cardData, originRect);
+        updateQueueJob(job.id, { status: 'processing' });
         upscaleViaEnlarger({ file: file }, function (blob) {
           // Fall back to the raw upload if the upscale pass didn't come
           // through — the user's own explicit choice should never just
-          // get silently dropped because Enlarger was unreachable.
-          showDriveToast(blob ? 'Upscaled — opening Card Conjurer.' : 'Upscale unavailable — using your image as-is.');
-          openEditorModal(cardData, originRect, blob || file);
+          // get silently dropped.
+          finishQueueJob(job, blob || file);
         });
       });
       fileInput.click();
@@ -2183,6 +2326,151 @@
     });
 
     document.body.appendChild(backdrop);
+  }
+
+  // ---- queue nav tab (site-specific literal injection) -------------------
+  //
+  // Injects a real tab into the site's own nav, matching its real
+  // markup/classes so it's indistinguishable from a native one — confirmed
+  // directly against the live site that this survives real interactions
+  // (typing, form submission, tab switching, a full route navigation to a
+  // different page), since its nav links aren't state-driven and React
+  // never touches this container's children once mounted. This selector
+  // strategy is the site's own real markup, not a generic pattern — a
+  // different MPC host site would need its own matching injection added
+  // here, not a change to this one.
+  function injectQueueNavTab() {
+    if (document.querySelector('.cc-bridge-queue-tab')) return;
+    const links = Array.prototype.filter.call(document.querySelectorAll('nav a'), function (a) {
+      return a.textContent.trim();
+    });
+    const referenceLink =
+      links.find(function (a) { return a.textContent.trim() === 'Editor'; }) ||
+      links.find(function (a) { return a.textContent.trim() === 'Explore'; });
+    if (!referenceLink) return; // Not a recognized nav structure — degrade silently, no tab.
+    const container = referenceLink.parentElement;
+
+    const tab = document.createElement('a');
+    tab.href = '#';
+    tab.className = referenceLink.className + ' cc-bridge-queue-tab';
+    updateQueueTabLabel(tab);
+    tab.addEventListener('click', function (event) {
+      event.preventDefault();
+      toggleQueuePanel(tab);
+    });
+    container.appendChild(tab);
+
+    queueListeners.push(function () {
+      updateQueueTabLabel(tab);
+      renderQueuePanelIfOpen();
+    });
+  }
+
+  function updateQueueTabLabel(tab) {
+    const activeOrReady = upscaleQueue.filter(function (j) {
+      return j.status !== 'failed';
+    }).length;
+    tab.textContent = 'Queue' + (activeOrReady ? ' (' + activeOrReady + ')' : '');
+  }
+
+  let queuePanelEl = null;
+
+  function toggleQueuePanel(anchorTab) {
+    if (queuePanelEl) {
+      closeQueuePanel();
+      return;
+    }
+    openQueuePanel(anchorTab);
+  }
+
+  function openQueuePanel(anchorTab) {
+    const rect = anchorTab.getBoundingClientRect();
+    const panel = document.createElement('div');
+    panel.className = 'cc-bridge-queue-panel';
+    panel.style.top = rect.bottom + 6 + 'px';
+    panel.style.left = Math.max(4, rect.left) + 'px';
+    document.body.appendChild(panel);
+    queuePanelEl = panel;
+    renderQueuePanel();
+
+    setTimeout(function () {
+      document.addEventListener('click', onQueuePanelOutsideClick, true);
+      document.addEventListener('keydown', onQueuePanelKeydown);
+    }, 0);
+  }
+
+  function closeQueuePanel() {
+    if (queuePanelEl && queuePanelEl.parentNode) queuePanelEl.parentNode.removeChild(queuePanelEl);
+    queuePanelEl = null;
+    document.removeEventListener('click', onQueuePanelOutsideClick, true);
+    document.removeEventListener('keydown', onQueuePanelKeydown);
+  }
+
+  function onQueuePanelOutsideClick(event) {
+    if (queuePanelEl && !queuePanelEl.contains(event.target) && !event.target.closest('.cc-bridge-queue-tab')) {
+      closeQueuePanel();
+    }
+  }
+
+  function onQueuePanelKeydown(event) {
+    if (event.key === 'Escape') closeQueuePanel();
+  }
+
+  function renderQueuePanelIfOpen() {
+    if (queuePanelEl) renderQueuePanel();
+  }
+
+  const QUEUE_STATUS_LABELS = { queued: 'Queued', processing: 'Upscaling…', ready: 'Ready', failed: 'Failed' };
+
+  function renderQueuePanel() {
+    if (!queuePanelEl) return;
+    queuePanelEl.innerHTML = '';
+    if (upscaleQueue.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'cc-bridge-queue-empty';
+      empty.textContent = 'No cards queued yet — pick a card and choose an art source to start one.';
+      queuePanelEl.appendChild(empty);
+      return;
+    }
+    upscaleQueue
+      .slice()
+      .reverse()
+      .forEach(function (job) {
+        const row = document.createElement('div');
+        row.className = 'cc-bridge-queue-row';
+
+        const name = document.createElement('span');
+        name.className = 'cc-bridge-queue-row-name';
+        name.textContent = job.cardName;
+        row.appendChild(name);
+
+        const status = document.createElement('span');
+        status.className = 'cc-bridge-queue-row-status cc-bridge-queue-status-' + job.status;
+        status.textContent = QUEUE_STATUS_LABELS[job.status] || job.status;
+        row.appendChild(status);
+
+        if (job.status === 'ready') {
+          row.classList.add('cc-bridge-queue-row-clickable');
+          row.title = 'Open in Card Conjurer';
+          row.addEventListener('click', function () {
+            closeQueuePanel();
+            openEditorModal(job.cardData, job.originRect, job.resultBlob);
+          });
+        }
+
+        const removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'cc-bridge-queue-row-remove';
+        removeBtn.textContent = '×';
+        removeBtn.setAttribute('aria-label', 'Remove from queue');
+        removeBtn.addEventListener('click', function (event) {
+          event.stopPropagation();
+          removeQueueJob(job.id);
+        });
+        row.appendChild(removeBtn);
+
+        queuePanelEl.appendChild(row);
+      });
   }
 
   // ---- observe for new/re-rendered cards -------------------------------
