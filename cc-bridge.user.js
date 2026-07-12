@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.16.0
+// @version      0.17.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -276,6 +276,14 @@
   // live after the early return too.
   let reimportPopoverEl = null;
 
+  // The Scryfall card JSON the sender already fetched (see
+  // fetchScryfallCard), if any — handed straight to Card Conjurer's own
+  // importCard() instead of Card Conjurer redundantly re-fetching it.
+  // Same TDZ-safe placement as the above, since doFillCardConjurerImport
+  // (which consumes this) lives after the early return too.
+  let pendingScryfallCard = null;
+  let pendingIsFullArtFlow = false;
+
   if (location.origin === getCCOrigin()) {
     // Only reskin when actually embedded via our own modal — a user who
     // separately has this script installed and visits Card Conjurer
@@ -357,6 +365,8 @@
       if (!data || typeof data.name !== 'string' || !data.name) return;
       senderOrigin = event.origin; // Real origin from the message itself, not a cross-origin read.
       if (data.customArtBlob) pendingCustomArtBlob = data.customArtBlob;
+      if (data.scryfallCard) pendingScryfallCard = data.scryfallCard;
+      pendingIsFullArtFlow = !!data.isFullArtFlow;
       const key = JSON.stringify(data);
       if (key === lastHandledPayload) return;
       lastHandledPayload = key;
@@ -442,13 +452,31 @@
     const nameInput = document.querySelector('#import-name');
     if (!nameInput) return; // CC markup changed, or navigation above didn't land.
 
+    nameInput.value = cardData.name; // Keeps CC's own UI state consistent for later manual edits either way.
+
+    // The sender already fetched this exact card (see fetchScryfallCard) —
+    // hand it straight to Card Conjurer's own importCard() instead of
+    // dispatching the name-change event that would make Card Conjurer
+    // redundantly re-fetch the identical data itself. This also sidesteps
+    // selectMatchingPrint entirely: there's only ever one candidate here,
+    // so there's no async "resolve which of several search results is the
+    // right one" step for Card Conjurer's change-event handling to race
+    // our own art application against.
+    if (pendingScryfallCard && typeof pageWindow.importCard === 'function') {
+      pageWindow.importCard([pendingScryfallCard]);
+      onImportPopulated(cardData);
+      return;
+    }
+
+    // Fallback: no pre-fetched card (fetchScryfallCard failed, or this
+    // import didn't go through the Scryfall-art path at all) — let Card
+    // Conjurer do its own normal name-driven fetch, same as always.
     const wantsSpecificPrint = !!(cardData.set_code && cardData.collector_number);
     const allPrintsCheckbox = document.querySelector('#importAllPrints');
     if (allPrintsCheckbox && wantsSpecificPrint) {
       allPrintsCheckbox.checked = true;
     }
 
-    nameInput.value = cardData.name;
     nameInput.dispatchEvent(new Event('change', { bubbles: true }));
 
     const importIndex = document.querySelector('#import-index');
@@ -467,27 +495,44 @@
       if (wantsSpecificPrint) {
         selectMatchingPrint(importIndex, cardData);
       }
-      // #import-index only just finished populating, which is what
-      // triggers Card Conjurer's own Scryfall auto-art-fetch as a side
-      // effect of importChanged() — by the time this MutationObserver
-      // callback actually runs (always after the DOM mutation that
-      // triggered it), that auto-fetch has already happened, so applying
-      // a custom art override here reliably wins rather than racing it.
-      applyPendingCustomArt();
-      setToolbarStatus('Building frame…');
-      const scryfallCardData = getSelectedScryfallCard();
-      loadBaseFrame(scryfallCardData, function () {
-        // No separate refreshAutoFrame() call needed here — setAutoFrame()
-        // inside loadBaseFrame already set #autoFrame and dispatched its
-        // change event, which is what actually builds card.frames.
-        applyBleedMargin(scryfallCardData);
-      });
+      onImportPopulated(cardData);
     });
     observer.observe(importIndex, { childList: true });
     // Safety net in case the Scryfall fetch never resolves (network error, etc).
     setTimeout(function () {
       observer.disconnect();
     }, 8000);
+  }
+
+  // Continuation shared by both the direct-importCard() path and the
+  // fallback (Card Conjurer's own fetch) path, once #import-index/scryfallCard
+  // is populated either way.
+  function onImportPopulated(cardData) {
+    setToolbarStatus('Building frame…');
+    const scryfallCardData = getSelectedScryfallCard();
+    loadBaseFrame(scryfallCardData, function () {
+      // Applied here — after frame/autoFrame selection, not before —
+      // since card.artBounds is frame-dependent (confirmed directly: the
+      // default frame's artBounds is roughly a quarter of the card, while
+      // FullArtNew/Borderless's is nearly the whole card) and 'autoFit'
+      // reads whatever artBounds is current at the moment the art image
+      // actually loads. Applying earlier would fit against the wrong
+      // (default, smaller) bounds for the full-art/borderless case.
+      // applyCustomArtRobust's own repeated reapply still covers any
+      // residual race with Card Conjurer's own art auto-fetch in the
+      // fallback path (changeCardIndex() applies its own art_crop
+      // synchronously as part of importCard()/the name-change handler, so
+      // by the time this callback runs, that's already settled either
+      // way — the robust reapply is cheap insurance, not load-bearing).
+      applyPendingCustomArt();
+      if (pendingIsFullArtFlow) {
+        applyFullArtInfoFlow(scryfallCardData, function () {
+          applyBleedMargin(scryfallCardData);
+        });
+      } else {
+        applyBleedMargin(scryfallCardData);
+      }
+    });
   }
 
   // Applies pendingCustomArtBlob (the upscaled-or-raw art the user chose
@@ -876,6 +921,64 @@
         callback();
       }
     }, 100);
+  }
+
+  // ---- full-art / borderless: collector info over the source image's own
+  // baked-in copyright line --------------------------------------------
+  //
+  // FullArtNew/Borderless (already selected by determineFrameSelection)
+  // ship their own opaque black bar across the bottom of the frame —
+  // confirmed directly against the live site, visible even before any art
+  // is applied. That bar sits on top of the art layer in the compositing
+  // order, so it already blanks out whatever the source image's own
+  // bottom edge has printed on it (including a real card's baked-in "™ &
+  // © Wizards of the Coast" line) — nothing to draw ourselves there.
+  //
+  // What's missing is the actual collector info text: Card Conjurer's own
+  // "bottom info" system (#info-number/#info-rarity/#info-set/#info-artist,
+  // gated by #enableCollectorInfo, drawn by bottomInfoEdited()) already
+  // deliberately skips drawing its own "Wizards of the Coast"/"NOT FOR
+  // SALE"/"CardConjurer.com" placeholder lines (see bottomInfoEdited's own
+  // skip-list) — so populating these fields and triggering a draw gives
+  // exactly "collector info only, no WotC copyright" with no extra
+  // filtering needed on this end. Field mapping mirrors Card Conjurer's
+  // own import-time population code exactly (creator-23.js, the
+  // enableImportCollectorInfo branch) for consistent formatting.
+  //
+  // bottomInfoEdited() is genuinely async (awaits internally) — confirmed
+  // directly: sampling the composited canvas right after a fire-and-forget
+  // call showed nothing drawn, awaiting the same call showed the real
+  // text. Skipping the further /sets/{code} lookup Card Conjurer's own
+  // import does purely for zero-padding the collector number against the
+  // set's printed size — cosmetic only, not needed for the actual ask.
+  function applyFullArtInfoFlow(scryfallCardData, callback) {
+    if (!scryfallCardData) {
+      callback();
+      return;
+    }
+    const numberEl = document.querySelector('#info-number');
+    const rarityEl = document.querySelector('#info-rarity');
+    const setEl = document.querySelector('#info-set');
+    const langEl = document.querySelector('#info-language');
+    const enableEl = document.querySelector('#enableCollectorInfo');
+    if (numberEl) numberEl.value = scryfallCardData.collector_number || '';
+    if (rarityEl) {
+      rarityEl.value = scryfallCardData.rarity ? scryfallCardData.rarity[0].toUpperCase() : '';
+    }
+    if (setEl) setEl.value = (scryfallCardData.set || '').toUpperCase();
+    if (langEl) langEl.value = (scryfallCardData.lang || '').toUpperCase();
+    if (enableEl) enableEl.checked = true;
+    // Also sets #art-artist and triggers its own bottomInfoEdited() call —
+    // harmless (bottomInfoEdited is idempotent/cheap), the awaited call
+    // below is the one that's actually waited on before continuing.
+    if (scryfallCardData.artist && typeof pageWindow.artistEdited === 'function') {
+      pageWindow.artistEdited(scryfallCardData.artist);
+    }
+    if (typeof pageWindow.bottomInfoEdited === 'function') {
+      Promise.resolve(pageWindow.bottomInfoEdited()).then(callback, callback);
+    } else {
+      callback();
+    }
   }
 
   // ---- bleed margin ----------------------------------------------------
@@ -1475,13 +1578,67 @@
     return el ? el.getAttribute(attr) || '' : '';
   }
 
-  // The card's own rendered art URL — read straight off the DOM (same
-  // img.card-img element extractCardData already knows about), not a new
-  // fetch of any kind. Whatever the host page is already displaying is
-  // what gets upscaled; no separate Scryfall API call from this script.
+  // The card's own rendered image URL — read straight off the DOM (same
+  // img.card-img element extractCardData already knows about). This is a
+  // *full card* image (mpchost sites here are Google-Drive-sourced print
+  // fronts, not raw Scryfall art), never the art alone — only correct as
+  // an art-layer source for the full-art/borderless flow below, which
+  // wants exactly that: the whole finished card image, upscaled and
+  // placed to fill the larger full-art/borderless art window.
   function extractCardArtUrl(rootEl) {
     const img = rootEl.querySelector('img.card-img');
     return img && img.src ? img.src : null;
+  }
+
+  // ---- Scryfall lookup (see CLAUDE.md's narrow exception for this) ------
+  //
+  // The mpchost page has no Scryfall data at all (name/set/collector only
+  // — confirmed by reading the site's own the card data model/its serialization code code,
+  // which has no art_crop/full_art/border_color fields to give us). Card
+  // Conjurer normally fetches this itself once it opens, from this exact
+  // same public, unauthenticated, CORS-open endpoint — so this isn't a
+  // new kind of access, just doing it a beat earlier and hand it to CC
+  // directly (see pageWindow.importCard usage in the receiver) instead of
+  // CC redundantly re-fetching the same data a moment later.
+  function fetchScryfallCard(cardData, callback) {
+    let url;
+    if (cardData.set_code && cardData.collector_number) {
+      url =
+        'https://api.scryfall.com/cards/' +
+        encodeURIComponent(cardData.set_code.toLowerCase()) +
+        '/' +
+        encodeURIComponent(cardData.collector_number);
+    } else {
+      url = 'https://api.scryfall.com/cards/named?fuzzy=' + encodeURIComponent(cardData.name);
+    }
+    fetch(url)
+      .then(function (res) {
+        if (!res.ok) throw new Error('Scryfall lookup failed: ' + res.status);
+        return res.json();
+      })
+      .then(function (json) {
+        callback(json);
+      })
+      .catch(function () {
+        callback(null);
+      });
+  }
+
+  // A card's art_crop, handling both normal cards (image_uris directly on
+  // the card) and modal/transform/split cards (image_uris nested under
+  // the front face) — Scryfall omits the top-level image_uris entirely
+  // for those layouts.
+  function getArtCropUrl(scryfallCard) {
+    if (!scryfallCard) return null;
+    if (scryfallCard.image_uris && scryfallCard.image_uris.art_crop) {
+      return scryfallCard.image_uris.art_crop;
+    }
+    const face = scryfallCard.card_faces && scryfallCard.card_faces[0];
+    return (face && face.image_uris && face.image_uris.art_crop) || null;
+  }
+
+  function isFullArtOrBorderless(scryfallCard) {
+    return !!(scryfallCard && (scryfallCard.full_art || scryfallCard.border_color === 'borderless'));
   }
 
   // The full Enlarger tool, embedded directly — no separate hosting at
@@ -2328,15 +2485,31 @@
     scryfallOpt.textContent = 'Use Scryfall art';
     scryfallOpt.addEventListener('click', function () {
       closeArtSourcePopover();
-      const artUrl = extractCardArtUrl(rootEl);
       const job = addQueueJob(cardData, originRect);
-      if (!artUrl) {
-        finishQueueJob(job, null);
-        return;
-      }
       updateQueueJob(job.id, { status: 'processing' });
-      upscaleViaEnlarger({ url: artUrl }, function (blob) {
-        finishQueueJob(job, blob);
+      fetchScryfallCard(cardData, function (scryfallCard) {
+        if (!scryfallCard) {
+          // No pre-fetch available (network hiccup, unknown card) — let
+          // Card Conjurer's own import + art fetch run untouched rather
+          // than falling back to the full card image (which is what
+          // caused the wrong-image bug this replaces).
+          finishQueueJob(job, null);
+          return;
+        }
+        // Stashed on cardData (same object reference the job already
+        // holds) so it rides along through openEditorModal's payload
+        // without adding another parameter to thread through.
+        cardData.scryfallCard = scryfallCard;
+        const isFullArt = isFullArtOrBorderless(scryfallCard);
+        cardData.isFullArtFlow = isFullArt;
+        const artUrl = isFullArt ? extractCardArtUrl(rootEl) : getArtCropUrl(scryfallCard);
+        if (!artUrl) {
+          finishQueueJob(job, null);
+          return;
+        }
+        upscaleViaEnlarger({ url: artUrl }, function (blob) {
+          finishQueueJob(job, blob);
+        });
       });
     });
 
@@ -2472,6 +2645,13 @@
     // Scryfall auto-art-fetch settles (doFillCardConjurerImport), so this
     // overrides it rather than racing it.
     if (customArtBlob) payload.customArtBlob = customArtBlob;
+    // The card JSON already fetched via fetchScryfallCard (see
+    // showArtSourcePopover) — plain data, structured-clone-safe same as
+    // everything else here. Lets the receiver hand it straight to Card
+    // Conjurer's own importCard() instead of Card Conjurer redundantly
+    // re-fetching the same card itself.
+    if (cardData.scryfallCard) payload.scryfallCard = cardData.scryfallCard;
+    if (cardData.isFullArtFlow) payload.isFullArtFlow = true;
 
     iframe.addEventListener('load', function () {
       let attempts = 0;
