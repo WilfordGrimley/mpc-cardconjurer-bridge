@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.17.0
+// @version      0.18.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -862,16 +862,70 @@
   // with nothing to notice or fix it. Re-checking a few times over the
   // next couple of seconds and re-clicking if something clobbered it
   // catches this reliably in practice.
+  //
+  // addFrame() itself has no dedup at all — it unconditionally unshifts a
+  // new frame onto card.frames every time "Add Frame to Card" is clicked
+  // (confirmed by reading creator-23.js directly), so re-clicking it isn't
+  // actually idempotent the way the old comment here claimed. Left
+  // unguarded, this produced exactly the visible bug: up to 5 duplicate
+  // border-extension layers stacked on top of each other from this
+  // function's own retries, plus one more from Card Conjurer's own
+  // auto-triggered default-pack load landing independently — 6 black
+  // borders on one card, confirmed against a real export. Fixed by only
+  // clicking when card.frames[0] (unshift means index 0 is the most
+  // recently added) isn't already the right frame — genuinely idempotent
+  // now, not just re-clicking and hoping — with a same-name dedup pass
+  // once settled to clean up anything that slipped through from the race
+  // this function exists to defeat in the first place.
   function applyManualFrameSelectionRobust(targetName, callback, checksRemaining) {
     checksRemaining = checksRemaining === undefined ? 4 : checksRemaining;
-    applyManualFrameSelection(targetName); // Idempotent — re-clicking an already-correct option is harmless.
+    const frames = pageWindow.card && pageWindow.card.frames;
+    const currentTop = Array.isArray(frames) && frames.length ? frames[0] : null;
+    if (!currentTop || currentTop.name !== targetName) {
+      applyManualFrameSelection(targetName);
+    }
     if (checksRemaining <= 0) {
+      dedupeFramesByName(targetName);
       callback();
       return;
     }
     setTimeout(function () {
       applyManualFrameSelectionRobust(targetName, callback, checksRemaining - 1);
     }, 700);
+  }
+
+  // Removes all but the first (most recently added, per addFrame's own
+  // unshift ordering) frame matching targetName — cleans up any duplicates
+  // that landed before this function's own idempotency check could catch
+  // them (e.g. Card Conjurer's own default-pack auto-load racing our first
+  // call). Goes through the same #frame-list "X" button / removeFrame()
+  // Card Conjurer's own frame-element editor uses, rather than splicing
+  // card.frames directly, so the array and its DOM list stay in sync for
+  // any later manual edit. Collects every close button to remove in one
+  // read-only pass *before* clicking any of them — removeFrame's own index
+  // lookup is computed live from the DOM at click time, so clicking
+  // stale/shifted indices while still walking the (shrinking) live array
+  // would skip entries; clicking real element references afterward avoids
+  // that regardless of how each click reshuffles what's left.
+  function dedupeFramesByName(targetName) {
+    const frames = pageWindow.card && pageWindow.card.frames;
+    const frameList = document.querySelector('#frame-list');
+    if (!Array.isArray(frames) || !frameList) return;
+    const children = frameList.children;
+    const toRemove = [];
+    let seenOne = false;
+    for (let i = 0; i < frames.length && i < children.length; i++) {
+      if (frames[i].name !== targetName) continue;
+      if (!seenOne) {
+        seenOne = true;
+        continue;
+      }
+      const closeBtn = children[i].querySelector('.frame-element-close');
+      if (closeBtn) toRemove.push(closeBtn);
+    }
+    toRemove.forEach(function (closeBtn) {
+      closeBtn.click();
+    });
   }
 
   // Selecting a frame group loads /js/frames/group<X>.js, which (per every
