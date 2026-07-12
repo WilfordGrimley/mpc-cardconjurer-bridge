@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.9.0
+// @version      0.10.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -35,6 +35,15 @@
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   const DEFAULT_CC_ORIGIN = 'http://localhost:4242';
+  // Shared default so Drive export works out of the box for installers who
+  // don't want to set up their own Google Cloud OAuth client — but it's a
+  // shared quota/billing pool and a single point of failure across every
+  // installer using it (see getDriveClientId/isUsingDefaultDriveClientId
+  // below for the encouragement path away from it). Empty string disables
+  // the default entirely (falls back to requiring the user's own Client
+  // ID, same as before this existed) — intentionally left blank here until
+  // the repo owner supplies a real one.
+  const DEFAULT_DRIVE_CLIENT_ID = '794263898427-md1q1cc8qo15kq2fejr3fooi3tvqipau.apps.googleusercontent.com';
   const DEFAULT_ENABLED_ORIGINS = [
     'https://mpcfill.com',
     'https://mpcfill.com',
@@ -82,12 +91,20 @@
   // why. That means the Client ID's "Authorized JavaScript origins" needs
   // the *host site's* origin (e.g. https://mpcfill.com), not the CC
   // origin.
+  //
+  // A custom Client ID (set via the menu command below) always wins over
+  // DEFAULT_DRIVE_CLIENT_ID — the shared default exists so this works with
+  // zero setup, not to discourage anyone from running their own.
   function getDriveClientId() {
-    return GM_getValue('driveClientId', '');
+    return GM_getValue('driveClientId', '') || DEFAULT_DRIVE_CLIENT_ID;
   }
 
   function setDriveClientId(clientId) {
     GM_setValue('driveClientId', clientId);
+  }
+
+  function isUsingDefaultDriveClientId() {
+    return !GM_getValue('driveClientId', '') && !!DEFAULT_DRIVE_CLIENT_ID;
   }
 
   function getEnabledOrigins() {
@@ -145,17 +162,32 @@
   );
 
   GM_registerMenuCommand('Configure Google Drive Client ID (for Drive export)', function () {
-    const current = getDriveClientId();
+    // The raw custom value, not getDriveClientId()'s fallback-merged
+    // result — pre-filling the prompt with the shared default would make
+    // it look like "your" saved value when it isn't one.
+    const current = GM_getValue('driveClientId', '');
+    const usingDefaultNote = DEFAULT_DRIVE_CLIENT_ID
+      ? '\n\nLeave blank to use the built-in shared default — works with zero setup, but shares a Google ' +
+        'Cloud quota/billing pool across everyone using it, and stops working for you if that project ever ' +
+        'changes. Set your own here for an independent, private connection instead.'
+      : '';
     const input = prompt(
       'Google OAuth Client ID for Drive export — Data Access → add the drive.file scope, ' +
         'then create an OAuth Client ID and add the origin of the site you conjure cards from ' +
         '(e.g. https://mpcfill.com — NOT the Card Conjurer origin) as an Authorized ' +
-        'JavaScript origin:',
+        'JavaScript origin:' +
+        usingDefaultNote,
       current
     );
     if (input === null) return;
     setDriveClientId(input.trim());
-    alert('cc-bridge: Google Drive Client ID ' + (input.trim() ? 'saved.' : 'cleared.'));
+    if (input.trim()) {
+      alert('cc-bridge: Google Drive Client ID saved — this install now uses its own, not the shared default.');
+    } else if (DEFAULT_DRIVE_CLIENT_ID) {
+      alert('cc-bridge: cleared — back to the built-in shared default for Drive export.');
+    } else {
+      alert('cc-bridge: cleared. No shared default is configured, so Drive export is now unavailable until you set a Client ID.');
+    }
   });
 
   // ---- Card Conjurer receiver -------------------------------------------
@@ -1290,7 +1322,22 @@
       );
       return;
     }
-    showDriveToast('Connecting to Google Drive…');
+    // One-time nudge toward running your own Client ID instead of relying
+    // on the shared default — not shown again once seen, so it informs
+    // without nagging every connect.
+    if (isUsingDefaultDriveClientId() && !GM_getValue('seenDriveDefaultNotice', false)) {
+      GM_setValue('seenDriveDefaultNotice', true);
+      alert(
+        'cc-bridge: this is using the built-in shared Google Drive connection — works with zero setup, ' +
+          'but shares a Google Cloud quota/billing pool across everyone using it, and could stop working ' +
+          'if that shared project ever changes. For your own independent, private connection instead, ' +
+          'set one up via the Tampermonkey menu → "Configure Google Drive Client ID (for Drive export)" ' +
+          '— a few minutes in Google Cloud Console. This notice won\'t show again.'
+      );
+    }
+    showDriveToast(
+      'Connecting to Google Drive' + (isUsingDefaultDriveClientId() ? ' (shared default)' : '') + '…'
+    );
     ensureGisLoaded(function () {
       if (!driveTokenClient) {
         driveTokenClient = pageWindow.google.accounts.oauth2.initTokenClient({
