@@ -1508,6 +1508,16 @@
     '  position: absolute;' +
     '  top: 4px;' +
     '  right: 4px;' +
+    // The anchor is Bootstrap's `.ratio` box (see BUTTON_ANCHOR_CLASS),
+    // which carries `.ratio > * { position: absolute; top: 0; left: 0;
+    // width: 100%; height: 100% }` — a rule that targets *any* direct
+    // child, including this button, and would otherwise balloon it to
+    // the full size of the card. left/width/height/max-width pin it back
+    // to its own natural button size instead of inheriting those.
+    '  left: auto;' +
+    '  width: auto;' +
+    '  height: auto;' +
+    '  max-width: none;' +
     '  z-index: 10;' +
     '  font-size: 11px;' +
     '  line-height: 1;' +
