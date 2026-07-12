@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.18.0
+// @version      0.19.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -464,10 +464,41 @@
     }, 8000);
   }
 
+  // Card Conjurer's own changeCardIndex() (run as part of every import,
+  // regardless of how it's triggered) always fires its own "art cycling"
+  // fetch — fetchScryfallData(cardToImport.name, artFromScryfall, 'art'),
+  // a name-wide search across every printing with different art, purely
+  // to populate the #art-index "browse alternate arts" dropdown. Its
+  // callback chain (artFromScryfall -> changeArtIndex) unconditionally
+  // calls uploadArt(...) and artistEdited(...) with whatever the search's
+  // first result happens to be — confirmed the hard way: a full-art
+  // EOS/37 import (artist "Andrew Theophilopoulos") ended up with artist
+  // "Bastien Grivet" and a plain remote art_crop URL instead of our
+  // upscaled blob, because this fetch resolves *after* our own art/info
+  // application and silently overwrites it. cc-bridge never uses the art-
+  // cycling feature at all, so there's no legitimate call here to
+  // preserve — neutered for the duration of our own import (a fixed
+  // window rather than a precise signal, since the underlying fetch has
+  // no exposed completion hook of its own) and restored afterward so any
+  // later *manual* use of Card Conjurer's own dropdown still works.
+  function suppressArtCycling() {
+    if (typeof pageWindow.changeArtIndex !== 'function' || pageWindow.changeArtIndex.__ccBridgeSuppressed) return;
+    const original = pageWindow.changeArtIndex;
+    const suppressed = function () {};
+    suppressed.__ccBridgeSuppressed = true;
+    pageWindow.changeArtIndex = suppressed;
+    setTimeout(function () {
+      if (pageWindow.changeArtIndex === suppressed) {
+        pageWindow.changeArtIndex = original;
+      }
+    }, 10000);
+  }
+
   function doFillCardConjurerImport(cardData) {
     const nameInput = document.querySelector('#import-name');
     if (!nameInput) return; // CC markup changed, or navigation above didn't land.
 
+    suppressArtCycling();
     nameInput.value = cardData.name; // Keeps CC's own UI state consistent for later manual edits either way.
 
     // The sender already fetched this exact card (see fetchScryfallCard) —
