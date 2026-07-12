@@ -2175,9 +2175,24 @@
   // cardType, setCode, collectorNumber}. Mapped explicitly below — not a
   // blind Object.assign — since the event's camelCase keys don't match the
   // payload's snake_case ones.
+  //
+  // Dispatched only from CardSlot.tsx (the project-editor grid) — never
+  // from Card.tsx, CardDetailedViewModal.tsx, or ProxyPrints' printing-tag
+  // candidates. lastCardSelectedTarget (the event's own .target, which
+  // custom events keep stable through bubbling regardless of listener
+  // location) is tracked alongside the detail so handleConjureTrigger can
+  // confirm it actually came from the card being conjured, not just "was
+  // the most recent selection somewhere on the page" — without that check,
+  // clicking conjure on a printing-tag candidate would silently overwrite
+  // its correct, freshly-read data-card-set-code/data-card-collector-number
+  // with whatever card was last selected in the project editor, since that
+  // feature never fires this event at all and the stale detail would
+  // otherwise look just as valid as a real one.
   let lastCardSelectedDetail = null;
+  let lastCardSelectedTarget = null;
   document.addEventListener('mpc:card-selected', function (event) {
     lastCardSelectedDetail = event && event.detail ? event.detail : null;
+    lastCardSelectedTarget = event ? event.target : null;
   });
 
   function mergeCardSelectedDetail(cardData, detail) {
@@ -2542,7 +2557,16 @@
     let cardData = extractCardData(rootEl);
     if (!cardData) return;
 
-    if (lastCardSelectedDetail && lastCardSelectedDetail.name) {
+    // Only trust lastCardSelectedDetail if it was actually dispatched from
+    // *this* card (see the declaration above) — otherwise it's some other
+    // card's stale selection and would silently override rootEl's own
+    // correct data-card-set-code/data-card-collector-number.
+    if (
+      lastCardSelectedDetail &&
+      lastCardSelectedDetail.name &&
+      lastCardSelectedTarget &&
+      rootEl.contains(lastCardSelectedTarget)
+    ) {
       cardData = mergeCardSelectedDetail(cardData, lastCardSelectedDetail);
     }
 
