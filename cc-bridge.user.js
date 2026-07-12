@@ -1906,20 +1906,21 @@
     if (rootEl.hasAttribute(INJECTED_MARKER_ATTR)) return;
     if (!extractCardData(rootEl)) return;
 
-    // Anchor to the art's own box (img.card-img's parent), not to rootEl
-    // itself — rootEl is whatever CARD_ROOT_SELECTOR matched, which on a
-    // card grid tile is the *whole* tile (header + art + name footer) and
-    // on ProxyPrints'/mpcfill's card-details modal is the entire
-    // viewport-covering modal element. Anchoring to rootEl in either case
-    // puts the button somewhere other than on the card art (grid: up in
-    // the header strip; details modal: pinned to a corner of the browser
-    // viewport, effectively unclickable). img.card-img's immediate parent
-    // is the tight, already-positioned box around just the art in both
-    // layouts, since both reuse the same image component. Falls back to
-    // rootEl if the art hasn't rendered yet — a self-correcting cosmetic
-    // edge case, not worth extra re-anchoring logic for.
-    const artImg = rootEl.querySelector('img.card-img');
-    const anchorEl = (artImg && artImg.parentElement) || rootEl;
+    // Anchor to rootEl (the card tile) by default — that's what's actually
+    // sized to the card on a normal grid. The one exception: MPC
+    // Autofill's card-details modal also matches CARD_ROOT_SELECTOR, but
+    // *is* the entire viewport-covering modal (position: fixed), not a
+    // card-sized tile — anchoring there pins the button to a corner of the
+    // browser viewport instead of the card. Anchor to the art's own box
+    // (img.card-img's parent) only in that one case; it's not used as the
+    // default because that box isn't always flush with the rendered art
+    // (can be letterboxed/wider than the actual image), which would push
+    // the button off the card on the grid.
+    let anchorEl = rootEl;
+    if (getComputedStyle(rootEl).position === 'fixed') {
+      const artImg = rootEl.querySelector('img.card-img');
+      if (artImg && artImg.parentElement) anchorEl = artImg.parentElement;
+    }
 
     const computedPosition = getComputedStyle(anchorEl).position;
     if (computedPosition === 'static') {
