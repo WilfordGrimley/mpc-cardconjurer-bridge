@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.12.0
+// @version      0.13.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -76,19 +76,6 @@
   };
 
   // ---- config helpers -------------------------------------------------
-
-  // The full URL to the user's own self-hosted Enlarger page — same "user
-  // supplies their own instance" pattern as the CC origin below. Empty
-  // means the "use Scryfall art"/"upload my own image" choice still
-  // appears, but just opens Card Conjurer directly without an upscale
-  // pass (degrades gracefully rather than being a hard requirement).
-  function getEnlargerUrl() {
-    return GM_getValue('enlargerUrl', '');
-  }
-
-  function setEnlargerUrl(url) {
-    GM_setValue('enlargerUrl', url);
-  }
 
   function getCCOrigin() {
     return GM_getValue('ccOrigin', DEFAULT_CC_ORIGIN);
@@ -183,35 +170,6 @@
     }
     setCCOrigin(parsed.origin);
     alert('cc-bridge: Card Conjurer origin set to ' + parsed.origin);
-  });
-
-  GM_registerMenuCommand('Configure Enlarger URL (art upscaling)', function () {
-    const current = getEnlargerUrl();
-    const input = prompt(
-      'Enlarger page URL (your own self-hosted instance — e.g. https://your-host/enlarger). Leave blank to skip ' +
-        'the upscale pass entirely and go straight to Card Conjurer:',
-      current
-    );
-    if (input === null) return;
-    const trimmed = input.trim();
-    if (!trimmed) {
-      setEnlargerUrl('');
-      alert('cc-bridge: Enlarger URL cleared — the art-source choice will open Card Conjurer directly.');
-      return;
-    }
-    let parsed;
-    try {
-      parsed = new URL(trimmed);
-    } catch (e) {
-      alert('cc-bridge: "' + trimmed + '" is not a valid URL. Origin not changed.');
-      return;
-    }
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      alert('cc-bridge: origin must be http:// or https://. Origin not changed.');
-      return;
-    }
-    setEnlargerUrl(trimmed);
-    alert('cc-bridge: Enlarger URL set to ' + trimmed);
   });
 
   GM_registerMenuCommand(
@@ -1376,6 +1334,332 @@
     return img && img.src ? img.src : null;
   }
 
+  // The full Enlarger tool, embedded directly — no separate hosting at
+  // all. Runs entirely headless: no visible UI, so no fonts/CSS either
+  // (nothing to ever render on screen). Turned into a blob: URL at
+  // hand-off time (see upscaleViaEnlarger) rather than a data: URL —
+  // confirmed directly against a real page: a blob: iframe's own
+  // location.origin, and the origin the parent sees on messages back
+  // from it, both correctly report the *creating* page's real origin,
+  // not "null"/opaque the way a data: URL's would — so the existing
+  // exact-origin postMessage validation this project uses everywhere
+  // else still applies cleanly here, with no separate origin to
+  // configure at all.
+  const ENLARGER_HTML = `<title>Enlarger (background)</title>
+<script>
+(function () {
+  'use strict';
+
+  // onnxruntime-web's own internal WASM-backend init tries several CDN
+  // fallback paths and can leave a stray rejected promise behind even
+  // when the failure it caused was already caught and handled correctly
+  // (confirmed in the interactive build this was stripped down from) —
+  // only about not letting a third-party library's internals surface as
+  // a raw uncaught error in this tab.
+  window.addEventListener('unhandledrejection', function (event) {
+    console.warn('Enlarger: suppressed an unhandled promise rejection (likely onnxruntime-web internals):', event.reason);
+    event.preventDefault();
+  });
+
+  // No visible UI at all — this only ever runs embedded as a hidden
+  // iframe cc-bridge creates from an inline blob: URL (see
+  // upscaleViaEnlarger in cc-bridge.user.js), so window.parent is always
+  // the real receiver and location.origin always matches it (blob: URLs
+  // inherit the creating document's origin for both, confirmed directly:
+  // a blob: iframe's location.origin and the postMessage event.origin the
+  // parent sees both report the parent's own real origin, not "null" or
+  // anything blob-specific).
+  window.addEventListener('message', function (event) {
+    const data = event.data;
+    if (!data || data.type !== 'enlarger-load') return;
+    const cardData = data.cardData || null;
+    const scaleFactor = typeof data.scale === 'number' && data.scale > 0 ? data.scale : 2;
+    const source = data.url || data.dataUrl;
+    if (!source) return;
+
+    loadImage(source, !!data.url)
+      .then(function (img) {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        canvas.getContext('2d').drawImage(img, 0, 0);
+
+        if (data.modelUrl) {
+          return runCustomModel(canvas, data, scaleFactor).catch(function () {
+            // Any failure in the custom-model path (bad shape, CORS,
+            // network, wrong tensor layout) falls back to the built-in
+            // resampler rather than producing nothing.
+            return runBuiltin(canvas, scaleFactor);
+          });
+        }
+        return runBuiltin(canvas, scaleFactor);
+      })
+      .then(function (resultCanvas) {
+        resultCanvas.toBlob(function (blob) {
+          window.parent.postMessage({ type: 'enlarger-result', blob: blob, cardData: cardData }, location.origin);
+        }, 'image/png');
+      })
+      .catch(function (err) {
+        window.parent.postMessage(
+          { type: 'enlarger-result', blob: null, cardData: cardData, error: err.message },
+          location.origin
+        );
+      });
+  });
+
+  function loadImage(src, useCors) {
+    return new Promise(function (resolve, reject) {
+      const img = new Image();
+      // Scryfall's image CDN serves permissive CORS; crossOrigin lets us
+      // actually read pixels back out of the canvas afterward instead of
+      // hitting a tainted-canvas security error. Not set for data: URLs
+      // (the "upload your own image" path), which don't need it.
+      if (useCors) img.crossOrigin = 'anonymous';
+      img.onload = function () { resolve(img); };
+      img.onerror = function () { reject(new Error('failed to load source image')); };
+      img.src = src;
+    });
+  }
+
+  function runBuiltin(canvas, scaleFactor) {
+    const targetW = Math.round(canvas.width * scaleFactor);
+    const targetH = Math.round(canvas.height * scaleFactor);
+    // Fixed, sensible sharpen amount — no UI to expose a slider for it in
+    // background/headless use.
+    return Promise.resolve(upscaleImage(canvas, targetW, targetH, 18));
+  }
+
+  function runCustomModel(canvas, data, scaleFactor) {
+    const tileSize = data.tileSize || 128;
+    const overlap = data.tileOverlap || 8;
+    const channelOrder = data.channelOrder || 'rgb';
+    const nativeScale = data.modelScale || 4;
+    let onnxSession = null;
+
+    return ensureOrtLoaded()
+      .then(function () { return window.ort.InferenceSession.create(data.modelUrl); })
+      .then(function (session) {
+        onnxSession = session;
+        return runTiledInference(canvas, onnxSession, tileSize, overlap, channelOrder, nativeScale);
+      })
+      .then(function (result) {
+        if (nativeScale !== scaleFactor) {
+          const targetW = Math.round(canvas.width * scaleFactor);
+          const targetH = Math.round(canvas.height * scaleFactor);
+          return upscaleImage(result, targetW, targetH, 0);
+        }
+        return result;
+      });
+  }
+
+  // ---------------------------------------------------------------------
+  // Real, working upscaling: separable Lanczos-3 resample + light unsharp
+  // mask. Deterministic classical signal processing, not a trained
+  // super-resolution model — it sharpens what's already in the source, it
+  // doesn't invent detail the way a real model (Real-ESRGAN etc., via the
+  // optional custom-model path above) can. This is the fallback and
+  // default; see runCustomModel for the model path.
+  // ---------------------------------------------------------------------
+  function lanczosKernel(x, a) {
+    if (x === 0) return 1;
+    if (x <= -a || x >= a) return 0;
+    const px = Math.PI * x;
+    return (a * Math.sin(px) * Math.sin(px / a)) / (px * px);
+  }
+
+  function resampleAxis(srcData, srcW, srcH, dstW, dstH, horizontal, a) {
+    const scale = horizontal ? dstW / srcW : dstH / srcH;
+    const filterScale = Math.max(1, 1 / scale);
+    const support = a * filterScale;
+    const dstLen = horizontal ? dstW : dstH;
+    const out = new Float32Array((horizontal ? dstW * srcH : srcW * dstH) * 4);
+    const outW = horizontal ? dstW : srcW;
+
+    for (let d = 0; d < dstLen; d++) {
+      const center = (d + 0.5) / scale;
+      const left = Math.floor(center - support);
+      const right = Math.ceil(center + support);
+      const weights = [];
+      let wsum = 0;
+      for (let s = left; s <= right; s++) {
+        const w = lanczosKernel((s + 0.5 - center) / filterScale, a);
+        weights.push(w);
+        wsum += w;
+      }
+      if (wsum === 0) wsum = 1;
+
+      const otherLen = horizontal ? srcH : srcW;
+      for (let o = 0; o < otherLen; o++) {
+        let r = 0, g = 0, b = 0, al = 0;
+        for (let i = 0; i < weights.length; i++) {
+          let s = left + i;
+          s = Math.max(0, Math.min((horizontal ? srcW : srcH) - 1, s));
+          const idx = horizontal ? (o * srcW + s) * 4 : (s * srcW + o) * 4;
+          const w = weights[i] / wsum;
+          r += srcData[idx] * w; g += srcData[idx + 1] * w; b += srcData[idx + 2] * w; al += srcData[idx + 3] * w;
+        }
+        const outIdx = horizontal ? (o * outW + d) * 4 : (d * outW + o) * 4;
+        out[outIdx] = r; out[outIdx + 1] = g; out[outIdx + 2] = b; out[outIdx + 3] = al;
+      }
+    }
+    return out;
+  }
+
+  function unsharpMask(data, w, h, amountPct) {
+    if (amountPct <= 0) return data;
+    const amount = amountPct / 100;
+    const out = new Float32Array(data.length);
+    const kernel = [0.077847, 0.123317, 0.077847, 0.123317, 0.195346, 0.123317, 0.077847, 0.123317, 0.077847];
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let r = 0, g = 0, b = 0;
+        let k = 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            const sx = Math.max(0, Math.min(w - 1, x + dx));
+            const sy = Math.max(0, Math.min(h - 1, y + dy));
+            const idx = (sy * w + sx) * 4;
+            const wgt = kernel[k++];
+            r += data[idx] * wgt; g += data[idx + 1] * wgt; b += data[idx + 2] * wgt;
+          }
+        }
+        const idx = (y * w + x) * 4;
+        out[idx] = data[idx] + (data[idx] - r) * amount;
+        out[idx + 1] = data[idx + 1] + (data[idx + 1] - g) * amount;
+        out[idx + 2] = data[idx + 2] + (data[idx + 2] - b) * amount;
+        out[idx + 3] = data[idx + 3];
+      }
+    }
+    return out;
+  }
+
+  function upscaleImage(canvas, targetW, targetH, sharpenPct) {
+    const ctx = canvas.getContext('2d');
+    const srcData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    const a = 3;
+    const pass1 = resampleAxis(srcData, canvas.width, canvas.height, targetW, canvas.height, true, a);
+    const pass2 = resampleAxis(pass1, targetW, canvas.height, targetW, targetH, false, a);
+    const sharpened = unsharpMask(pass2, targetW, targetH, sharpenPct);
+
+    const out = document.createElement('canvas');
+    out.width = targetW; out.height = targetH;
+    const outCtx = out.getContext('2d');
+    const imgData = outCtx.createImageData(targetW, targetH);
+    for (let i = 0; i < sharpened.length; i++) {
+      imgData.data[i] = Math.max(0, Math.min(255, sharpened[i]));
+    }
+    outCtx.putImageData(imgData, 0, 0);
+    return out;
+  }
+
+  // ---------------------------------------------------------------------
+  // Optional custom ONNX model path. Loaded lazily, only when the handoff
+  // message actually includes a modelUrl. onnxruntime-web is fetched from
+  // a CDN, which needs real network access from wherever this ends up
+  // running (fine once embedded in a real userscript on a real page; the
+  // one thing that never worked was Claude's own sandboxed Artifact
+  // preview, which blocks all external requests by design).
+  //
+  // Tensor-shape assumptions below match a typical Real-ESRGAN ONNX
+  // export (NCHW, float32, 0..1 normalized, fixed native scale factor) —
+  // overridable via the handoff message's tileSize/tileOverlap/
+  // channelOrder/modelScale fields since not every export matches
+  // exactly.
+  // ---------------------------------------------------------------------
+  const ORT_CDN_URL = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/ort.min.js';
+
+  function ensureOrtLoaded() {
+    if (window.ort) return Promise.resolve();
+    return new Promise(function (resolve, reject) {
+      const script = document.createElement('script');
+      script.src = ORT_CDN_URL;
+      script.onload = function () { resolve(); };
+      script.onerror = function () { reject(new Error('could not load onnxruntime-web')); };
+      document.head.appendChild(script);
+    });
+  }
+
+  // Splits the source into overlapping tiles, runs each through the ONNX
+  // session, and stitches the (nativeScale×-larger) results back into one
+  // canvas — feeding a whole multi-megapixel card image into a model in
+  // one shot is both slow and often exceeds what the model's graph
+  // actually supports.
+  async function runTiledInference(canvas, onnxSession, tileSize, overlap, channelOrder, nativeScale) {
+    const srcCtx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    const outCanvas = document.createElement('canvas');
+    outCanvas.width = W * nativeScale;
+    outCanvas.height = H * nativeScale;
+    const outCtx = outCanvas.getContext('2d');
+
+    const stepX = tileSize - overlap * 2;
+    const stepY = tileSize - overlap * 2;
+    const tilesX = Math.max(1, Math.ceil(W / stepX));
+    const tilesY = Math.max(1, Math.ceil(H / stepY));
+
+    for (let ty = 0; ty < tilesY; ty++) {
+      for (let tx = 0; tx < tilesX; tx++) {
+        const sx = Math.max(0, Math.min(W - tileSize, tx * stepX - overlap));
+        const sy = Math.max(0, Math.min(H - tileSize, ty * stepY - overlap));
+        const tw = Math.min(tileSize, W - sx);
+        const th = Math.min(tileSize, H - sy);
+
+        const tileData = srcCtx.getImageData(sx, sy, tw, th);
+        const inputTensor = imageDataToTensor(tileData, channelOrder);
+        const feeds = {};
+        feeds[onnxSession.inputNames[0]] = inputTensor;
+        const results = await onnxSession.run(feeds);
+        const outputTensor = results[onnxSession.outputNames[0]];
+        const outTile = tensorToImageData(outputTensor, channelOrder);
+
+        const destX = sx * nativeScale;
+        const destY = sy * nativeScale;
+        const tmp = document.createElement('canvas');
+        tmp.width = outTile.width; tmp.height = outTile.height;
+        tmp.getContext('2d').putImageData(outTile, 0, 0);
+        outCtx.drawImage(tmp, destX, destY);
+
+        await new Promise(function (r) { setTimeout(r, 0); }); // yield between tiles
+      }
+    }
+    return outCanvas;
+  }
+
+  function imageDataToTensor(imageData, channelOrder) {
+    const data = imageData.data, width = imageData.width, height = imageData.height;
+    const chw = new Float32Array(3 * width * height);
+    const plane = width * height;
+    for (let i = 0; i < plane; i++) {
+      const r = data[i * 4] / 255, g = data[i * 4 + 1] / 255, b = data[i * 4 + 2] / 255;
+      if (channelOrder === 'bgr') {
+        chw[i] = b; chw[plane + i] = g; chw[plane * 2 + i] = r;
+      } else {
+        chw[i] = r; chw[plane + i] = g; chw[plane * 2 + i] = b;
+      }
+    }
+    return new window.ort.Tensor('float32', chw, [1, 3, height, width]);
+  }
+
+  function tensorToImageData(tensor, channelOrder) {
+    const dims = tensor.dims;
+    const h = dims[2], w = dims[3];
+    const plane = w * h;
+    const src = tensor.data;
+    const out = new ImageData(w, h);
+    for (let i = 0; i < plane; i++) {
+      let r = src[i], g = src[plane + i], b = src[plane * 2 + i];
+      if (channelOrder === 'bgr') { const t = r; r = b; b = t; }
+      out.data[i * 4] = Math.max(0, Math.min(255, r * 255));
+      out.data[i * 4 + 1] = Math.max(0, Math.min(255, g * 255));
+      out.data[i * 4 + 2] = Math.max(0, Math.min(255, b * 255));
+      out.data[i * 4 + 3] = 255;
+    }
+    return out;
+  }
+})();
+</script>
+`;
+
   // ---- Enlarger hand-off (upscale pass before Card Conjurer even opens) -
   //
   // Both art-source choices ("use Scryfall art" / "upload my own image")
@@ -1387,20 +1671,14 @@
   // caller proceeds without an upscale pass — never a hard blocker to
   // getting the card into Card Conjurer at all.
   function upscaleViaEnlarger(source, callback) {
-    const enlargerUrl = getEnlargerUrl();
-    if (!enlargerUrl) {
-      callback(null);
-      return;
-    }
-    let enlargerOrigin;
-    try {
-      enlargerOrigin = new URL(enlargerUrl).origin;
-    } catch (e) {
-      callback(null);
-      return;
-    }
+    // location.origin — not a configured URL's origin — since a blob:
+    // iframe's own location.origin, and the origin the parent sees on its
+    // postMessage replies, both inherit this page's real origin (verified
+    // directly, see the ENLARGER_HTML comment above).
+    const enlargerOrigin = location.origin;
 
     function sendHandoff(dataUrlOrUrl, isDataUrl) {
+      const blobUrl = URL.createObjectURL(new Blob([ENLARGER_HTML], { type: 'text/html' }));
       const iframe = document.createElement('iframe');
       iframe.style.display = 'none';
       let done = false;
@@ -1410,10 +1688,11 @@
         window.removeEventListener('message', onMessage);
         if (timeoutId) clearTimeout(timeoutId);
         if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
+        URL.revokeObjectURL(blobUrl);
       }
 
       function onMessage(event) {
-        if (event.origin !== enlargerOrigin) return;
+        if (event.origin !== enlargerOrigin || event.source !== iframe.contentWindow) return;
         const data = event.data;
         if (!data || data.type !== 'enlarger-result') return;
         done = true;
@@ -1423,21 +1702,21 @@
       window.addEventListener('message', onMessage);
 
       iframe.addEventListener('load', function () {
-        const payload = { type: 'enlarger-load', scale: 2, autoSend: true };
+        const payload = { type: 'enlarger-load', scale: 2 };
         if (isDataUrl) payload.dataUrl = dataUrlOrUrl;
         else payload.url = dataUrlOrUrl;
         iframe.contentWindow.postMessage(payload, enlargerOrigin);
       });
 
-      // Never let a slow/broken Enlarger instance block getting the card
-      // into Card Conjurer at all — fall through to no-upscale instead.
+      // Never let a slow/broken upscale pass block getting the card into
+      // Card Conjurer at all — fall through to no-upscale instead.
       timeoutId = setTimeout(function () {
         if (done) return;
         cleanup();
         callback(null);
       }, 20000);
 
-      iframe.src = enlargerUrl;
+      iframe.src = blobUrl;
       document.body.appendChild(iframe);
     }
 
@@ -1743,7 +2022,7 @@
     scryfallOpt.addEventListener('click', function () {
       closeArtSourcePopover();
       const artUrl = extractCardArtUrl(rootEl);
-      if (!artUrl || !getEnlargerUrl()) {
+      if (!artUrl) {
         openEditorModal(cardData, originRect);
         return;
       }
@@ -1769,10 +2048,6 @@
         const file = fileInput.files[0];
         fileInput.remove();
         if (!file) return;
-        if (!getEnlargerUrl()) {
-          openEditorModal(cardData, originRect, file);
-          return;
-        }
         showDriveToast('Upscaling your image…');
         upscaleViaEnlarger({ file: file }, function (blob) {
           // Fall back to the raw upload if the upscale pass didn't come
