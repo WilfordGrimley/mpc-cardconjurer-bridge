@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.5.0
+// @version      0.6.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -58,6 +58,13 @@
   const EXPORT_DB_STORE = 'handles';
   const EXPORT_DB_KEY = 'exportDir';
   const HAS_FS_ACCESS = typeof window.showDirectoryPicker === 'function';
+  // Bleed-margin border-extension name lookup — same TDZ reasoning as above.
+  const BORDER_EXTENSION_NAME_BY_COLOR = {
+    white: 'White Border Extension',
+    silver: 'Silver Border Extension',
+    gold: 'Gold Border Extension',
+    borderless: 'Borderless Extension',
+  };
 
   // ---- config helpers -------------------------------------------------
 
@@ -287,11 +294,12 @@
         selectMatchingPrint(importIndex, cardData);
       }
       setToolbarStatus('Building frame…');
-      loadBaseFrame(getSelectedScryfallCard(), function () {
+      const scryfallCardData = getSelectedScryfallCard();
+      loadBaseFrame(scryfallCardData, function () {
         // No separate refreshAutoFrame() call needed here — setAutoFrame()
         // inside loadBaseFrame already set #autoFrame and dispatched its
         // change event, which is what actually builds card.frames.
-        applyBleedMargin();
+        applyBleedMargin(scryfallCardData);
       });
     });
     observer.observe(importIndex, { childList: true });
@@ -352,39 +360,129 @@
   // layout. A real per-layout autoFrame equivalent for those, if one
   // exists, wasn't found in the time available here.
 
+  // Two families of frame choice exist in Card Conjurer, and this returns a
+  // selector for whichever applies:
+  //
+  //  - `autoFrame`: a value for #autoFrame — Card Conjurer's own
+  //    buildAutoFrames() (autoFrame.js) picks the color/legendary-crown/etc.
+  //    automatically. Only a handful of frame families have an #autoFrame
+  //    entry at all (confirmed against creator.html's real <option> list):
+  //    the plain "Regular" family (M15Regular-1/Borderless/FullArtNew/8th/
+  //    Seventh/...).
+  //  - `manualFrameName`: everything else. These packs (confirmed by
+  //    reading their scripts directly) populate availableFrames with
+  //    entries literally named 'White Frame'/'Blue Frame'/.../'Land Frame'/
+  //    'Artifact Frame'/'Multicolored Frame' — the exact same 8-way color
+  //    convention across every one of them (Margin, Showcase-5's
+  //    GenericShowcase, Misc-2's ABU, and Standard-3's Room/Battle/Case/
+  //    Class/Adventure/Split/Aftermath/Leveler/Flip) — so one derivation
+  //    (deriveColorFrameName) covers all of them. applyManualFrameSelection
+  //    below is what actually turns a name into a rendered frame image.
+  //
+  // Only structurally-necessary distinctions and cheaply-correct cosmetic
+  // upgrades are handled — not Scryfall Tagger (a separate, sparse,
+  // community-curated API nothing here calls) and not the ~150-entry list
+  // of set-specific showcase treatments Card Conjurer ships (Neon Ink,
+  // Draconic, Paranormal, etc.) since which *specific* one applies isn't
+  // reliably derivable from Scryfall's card-level fields, and the generic
+  // showcase frame below is still much closer than the plain frame.
   function determineFrameSelection(scryfallCardData) {
     if (!scryfallCardData) return null;
     const layout = scryfallCardData.layout || '';
     const typeLine = scryfallCardData.type_line || '';
+    const frameEra = scryfallCardData.frame || ''; // Scryfall's own border-era field: '1993'/'1997'/'2003'/'2015'/'future'.
+    const frameEffects = scryfallCardData.frame_effects || [];
+    const keywords = scryfallCardData.keywords || [];
+    const colorName = deriveColorFrameName(scryfallCardData);
 
-    if (layout === 'saga') return { group: 'Saga-1', pack: 'SagaRegular', autoFrame: null };
+    // --- layouts that need their own frame *elements* (extra art/text
+    // slots, different text positions) — a plain M15 frame renders wrong
+    // or incomplete for these, not just cosmetically different ---
+    if (layout === 'saga') return { group: 'Saga-1', pack: 'SagaRegular' };
     if (typeLine.indexOf('Planeswalker') !== -1) {
-      return { group: 'Planeswalker', pack: 'PlaneswalkerRegular', autoFrame: null };
+      return { group: 'Planeswalker', pack: 'PlaneswalkerRegular' };
     }
-    if (layout === 'modal_dfc') return { group: 'Modal-1', pack: 'ModalRegular', autoFrame: null };
+    if (layout === 'modal_dfc') return { group: 'Modal-1', pack: 'ModalRegular' };
+    if (typeLine.indexOf('Battle') !== -1) {
+      // Battles report layout:'transform' in Scryfall's data (same as
+      // ordinary DFCs) — checked via type_line, before the transform case
+      // below, so Battles don't fall into the wrong bucket.
+      return { group: 'Standard-3', pack: 'Battle', manualFrameName: colorName };
+    }
     // Front face only — a transform card's back face isn't part of this
     // import (MPC Autofill sources front/back as separate card slots).
-    if (layout === 'transform') return { group: 'DFC', pack: 'M15TransformFront', autoFrame: null };
+    if (layout === 'transform') return { group: 'DFC', pack: 'M15TransformFront' };
     if (layout === 'token' || typeLine.indexOf('Token') !== -1) {
-      return { group: 'Token-2', pack: 'TokenRegular-1', autoFrame: null };
+      return { group: 'Token-2', pack: 'TokenRegular-1' };
+    }
+    if (layout === 'class') return { group: 'Standard-3', pack: 'Class', manualFrameName: colorName };
+    if (layout === 'case') return { group: 'Standard-3', pack: 'Case', manualFrameName: colorName };
+    if (layout === 'leveler') return { group: 'Standard-3', pack: 'Leveler', manualFrameName: colorName };
+    if (layout === 'adventure') return { group: 'Standard-3', pack: 'Adventure', manualFrameName: colorName };
+    if (layout === 'flip') return { group: 'Standard-3', pack: 'Flip', manualFrameName: colorName };
+    if (layout === 'prototype') return { group: 'Standard-3', pack: 'Prototype' };
+    if (typeLine.indexOf('Attraction') !== -1) return { group: 'Standard-3', pack: 'Attraction' };
+    if (layout === 'split') {
+      // Room and Aftermath both report layout:'split' too, so they have to
+      // be distinguished before falling through to a plain Split frame.
+      if (typeLine.indexOf('Room') !== -1) {
+        return { group: 'Standard-3', pack: 'Room', manualFrameName: colorName };
+      }
+      if (keywords.indexOf('Aftermath') !== -1) {
+        return { group: 'Standard-3', pack: 'Aftermath', manualFrameName: colorName };
+      }
+      return { group: 'Standard-3', pack: 'Split', manualFrameName: colorName };
     }
 
-    // Structurally still a normal card either way — full_art/border_color
-    // only change which #autoFrame frame graphics get built, not the text
-    // field layout, so group/pack stay the same as the plain default below.
+    // --- cosmetic-only treatments on an otherwise-plain card: the regular
+    // frame below would still render a complete, correct card, so these
+    // are opportunistic upgrades. Checked most-visually-distinct first. ---
+    if (frameEffects.indexOf('showcase') !== -1) {
+      return { group: 'Showcase-5', pack: 'GenericShowcase', manualFrameName: colorName };
+    }
     // Legendary crowns etc. aren't handled here at all: autoFrame()'s own
     // buildAutoFrames() already detects "legendary"/"snow"/nyx-enchantment
     // straight from the type line and adds them automatically, for any of
-    // these frame choices (confirmed: Borderless and FullArtNew both have
-    // supportsCrown: true in autoFrame.js) — no extra logic needed here.
+    // these #autoFrame choices (confirmed: Borderless and FullArtNew both
+    // have supportsCrown: true in autoFrame.js) — no extra logic needed.
     if (scryfallCardData.full_art) {
       return { group: 'Standard-3', pack: 'M15Regular-1', autoFrame: 'FullArtNew' };
     }
     if (scryfallCardData.border_color === 'borderless') {
       return { group: 'Standard-3', pack: 'M15Regular-1', autoFrame: 'Borderless' };
     }
+    // Historical border eras. '2015' is the modern border (the plain
+    // default below); 'future' (Future Sight full-art frame) isn't handled
+    // — its pack keys frame choice by card *type* rather than color, a
+    // different selection axis, and future-shifted reprints are rare
+    // enough that the modern frame is an acceptable fallback.
+    if (frameEra === '1993') {
+      return { group: 'Misc-2', pack: 'ABU', manualFrameName: colorName };
+    }
+    if (frameEra === '2003') {
+      return { group: 'Standard-3', pack: 'M15Regular-1', autoFrame: '8th' };
+    }
+    if (frameEra === '1997') {
+      return { group: 'Standard-3', pack: 'M15Regular-1', autoFrame: 'Seventh' };
+    }
 
     return { group: 'Standard-3', pack: 'M15Regular-1', autoFrame: 'M15Regular-1' };
+  }
+
+  // Card Conjurer's own color-frame naming convention (see determineFrameSelection's
+  // comment above) — mirrors Magic's standard frame-color rule (land > multicolor >
+  // single color > colorless/artifact). Only needed for manualFrameName packs;
+  // #autoFrame-driven packs already do the equivalent detection internally.
+  function deriveColorFrameName(scryfallCardData) {
+    const typeLine = scryfallCardData.type_line || '';
+    const colors = scryfallCardData.colors || [];
+    if (typeLine.indexOf('Land') !== -1) return 'Land Frame';
+    if (colors.length >= 2) return 'Multicolored Frame';
+    if (colors.length === 1) {
+      const names = { W: 'White', U: 'Blue', B: 'Black', R: 'Red', G: 'Green' };
+      return (names[colors[0]] || 'Artifact') + ' Frame';
+    }
+    return 'Artifact Frame'; // Colorless nonland — artifacts, Eldrazi, etc.
   }
 
   function getSelectedScryfallCard() {
@@ -400,9 +498,25 @@
       callback(); // No Scryfall data to key off; let the caller carry on frameless.
       return;
     }
-    loadFramePack(selection.group, selection.pack, function () {
-      setAutoFrame(selection.autoFrame || 'M15Regular-1');
-      waitForFramesBuilt(callback);
+    resolveFramePack(selection.group, selection.pack, function () {
+      const loadBtn = document.querySelector('#loadFrameVersion');
+      if (loadBtn) loadBtn.click(); // Sets up bounds/text/card.version — never touches card.frames itself.
+      if (selection.autoFrame) {
+        setAutoFrame(selection.autoFrame);
+        waitForFramesBuilt(callback);
+      } else if (selection.manualFrameName) {
+        applyManualFrameSelectionRobust(selection.manualFrameName, function () {
+          waitForFramesBuilt(callback);
+        });
+      } else {
+        // Structural-only pack with no color concept (Saga, Planeswalker,
+        // Modal DFC, Transform, Token, Prototype, Attraction) and no
+        // #autoFrame equivalent of its own — fall back to the plain
+        // Regular frame graphic layered onto this pack's bounds, better
+        // than a blank card.
+        setAutoFrame('M15Regular-1');
+        waitForFramesBuilt(callback);
+      }
     });
   }
 
@@ -453,15 +567,117 @@
     autoFrameSelect.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
+  // ---- manual frame-option selection (shared) ---------------------------
+  //
+  // Card Conjurer's UI normally requires either a genuine double-click on a
+  // .frame-option (a same-index click within 500ms of the previous one —
+  // see doubleClick()/frameOptionClicked() in creator-23.js) or a manual
+  // click of "Add Frame to Card" (#addToFull) to actually call addFrame()
+  // and render anything. A single synthetic .click() on a .frame-option
+  // only updates selectedFrameIndex and the preview UI — confirmed the hard
+  // way: an earlier version of this script picked the right .frame-option
+  // but nothing ever rendered differently, because addFrame() was never
+  // actually being called. #addToFull's own onclick is literally
+  // `addFrame()` (confirmed in creator.html), so this calls it directly
+  // instead of trying to simulate a double-click gesture's timing.
+  function applyManualFrameSelection(targetName) {
+    if (!targetName) return;
+    const frames = pageWindow.availableFrames;
+    if (!Array.isArray(frames)) return;
+    const index = frames.findIndex(function (f) { return f.name === targetName; });
+    if (index < 0) return; // Not in this pack (e.g. pack failed to load) — degrade silently.
+    const options = document.querySelectorAll('#frame-picker .frame-option');
+    if (!options[index]) return;
+    options[index].click(); // Sets selectedFrameIndex + mask-picker UI only.
+    const addBtn = document.querySelector('#addToFull');
+    if (addBtn) addBtn.click(); // Actually calls addFrame() with that selection.
+  }
+
+  // resolveFramePack's "skip the redundant reload when our target is
+  // already the group's own default pack" optimization (below) still
+  // leaves that *original*, auto-triggered internal pack load running
+  // asynchronously and completely outside our control — and confirmed
+  // against the live site, it can finish well after our own selection
+  // already succeeded (main-thread contention, same as elsewhere in this
+  // file), silently reverting #frame-picker back to its own default choice
+  // with nothing to notice or fix it. Re-checking a few times over the
+  // next couple of seconds and re-clicking if something clobbered it
+  // catches this reliably in practice.
+  function applyManualFrameSelectionRobust(targetName, callback, checksRemaining) {
+    checksRemaining = checksRemaining === undefined ? 4 : checksRemaining;
+    applyManualFrameSelection(targetName); // Idempotent — re-clicking an already-correct option is harmless.
+    if (checksRemaining <= 0) {
+      callback();
+      return;
+    }
+    setTimeout(function () {
+      applyManualFrameSelectionRobust(targetName, callback, checksRemaining - 1);
+    }, 700);
+  }
+
+  // Selecting a frame group loads /js/frames/group<X>.js, which (per every
+  // group script's own source) synchronously calls Card Conjurer's own
+  // loadFramePacks() — populating #selectFramePack *and* auto-loading
+  // whichever pack is listed first for that group, via its own internal
+  // loadScript() call, before our group loadScript() promise even
+  // resolves. When our target pack is that same default (e.g. Margin-1 is
+  // the Margin group's own first pack), deliberately skipping our own
+  // redundant reload avoids a real, confirmed race: two concurrent loads
+  // of the identical pack script each independently re-populate
+  // availableFrames/#frame-picker, and whichever finishes last wins —
+  // unpredictably clobbering whichever one we intended.
+  function resolveFramePack(group, pack, callback) {
+    const groupSelect = document.querySelector('#selectFrameGroup');
+    const packSelect = document.querySelector('#selectFramePack');
+    if (!groupSelect || !packSelect || typeof pageWindow.loadScript !== 'function') {
+      callback(); // Degrade silently, as elsewhere.
+      return;
+    }
+    groupSelect.value = group;
+    pageWindow
+      .loadScript('/js/frames/group' + group + '.js')
+      .then(function () {
+        if (packSelect.value === pack) {
+          return waitForFramePickerPopulated(callback);
+        }
+        packSelect.value = pack;
+        return pageWindow.loadScript('/js/frames/pack' + pack + '.js').then(function () {
+          packSelect.value = pack; // Re-assert against the group's own (different) default-pack load.
+          waitForFramePickerPopulated(callback);
+        });
+      })
+      .catch(function () {
+        callback(); // Let the caller continue even if frame loading failed.
+      });
+  }
+
+  function waitForFramePickerPopulated(callback) {
+    let attempts = 0;
+    const intervalId = setInterval(function () {
+      attempts++;
+      const ready = document.querySelectorAll('#frame-picker .frame-option').length > 0;
+      if (ready || attempts > 50) {
+        // ~5s cap.
+        clearInterval(intervalId);
+        callback();
+      }
+    }, 100);
+  }
+
   // ---- bleed margin ----------------------------------------------------
   //
   // Verified against the live site: "1/8th Inch Margin" is a real frame
   // group (#selectFrameGroup value 'Margin'), not a checkbox. Selecting it
   // loads /js/frames/groupMargin.js, which populates #selectFramePack with
   // several themed packs plus a generic one ({name:'Generic Margins',
-  // value:'Margin-1'}).
+  // value:'Margin-1'}). That pack's own script (packMargin-1.js) defines
+  // multiple named border-extension images in its availableFrames array —
+  // 'Black Extension', 'White Border Extension', 'Silver Border Extension',
+  // 'Gold Border Extension', 'Borderless Extension', etc. — matching Card
+  // Conjurer's own frame's real border color, not a color we compute
+  // ourselves.
 
-  function applyBleedMargin(attempt) {
+  function applyBleedMargin(scryfallCardData, attempt) {
     attempt = attempt || 1;
     if (pageWindow.card && pageWindow.card.margins) {
       setToolbarStatus('');
@@ -478,66 +694,57 @@
     }
     setToolbarStatus('Applying bleed margin…');
 
-    loadFramePack('Margin', 'Margin-1', function () {
-      // Retry-until-confirmed rather than trying to predict exactly when
-      // the main thread frees up: the base frame's own image
-      // fetch/decode/composite work can still be running here (confirmed
-      // against the live site — it measurably delays anything queued after
-      // it, including this click's own async handler), so a first attempt
-      // can silently lose a race even after waitForFramesBuilt's settle
-      // check above. A fresh attempt once things actually quiet down
-      // reliably sticks (confirmed end-to-end against live production data).
-      let attempts = 0;
-      const intervalId = setInterval(function () {
-        attempts++;
-        const applied = !!(pageWindow.card && pageWindow.card.margins);
-        if (applied || attempts > 60) {
-          // ~12s per attempt.
-          clearInterval(intervalId);
-          if (applied) {
-            setToolbarStatus('');
-          } else {
-            applyBleedMargin(attempt + 1);
-          }
-        }
-      }, 200);
-    });
-  }
+    const borderColor = scryfallCardData && scryfallCardData.border_color;
+    const extensionName = BORDER_EXTENSION_NAME_BY_COLOR[borderColor] || 'Black Extension';
 
-  // Shared by base-frame and bleed-margin loading: selecting a frame group
-  // loads /js/frames/group<X>.js (populates #selectFramePack), selecting a
-  // pack loads /js/frames/pack<X>.js (wires up #loadFrameVersion's onclick
-  // for that specific pack — confirmed by reading several pack scripts;
-  // every one of them ends with exactly this assignment), and the frame is
-  // actually applied by clicking #loadFrameVersion. Rather than poll for
-  // some pack-specific side effect (which isn't a generalizable signal —
-  // different packs define different globals, if any), this calls Card
-  // Conjurer's own loadScript() directly and awaits its real promise
-  // (resolves on the underlying <script> tag's onload), the same function
-  // the page's own onchange handlers use internally.
-  function loadFramePack(group, pack, callback) {
-    const groupSelect = document.querySelector('#selectFrameGroup');
-    const packSelect = document.querySelector('#selectFramePack');
-    const loadBtn = document.querySelector('#loadFrameVersion');
-    if (!groupSelect || !packSelect || !loadBtn || typeof pageWindow.loadScript !== 'function') {
-      callback(); // Degrade silently, as elsewhere.
-      return;
-    }
-    groupSelect.value = group;
-    pageWindow
-      .loadScript('/js/frames/group' + group + '.js')
-      .then(function () {
-        packSelect.value = pack;
-        return pageWindow.loadScript('/js/frames/pack' + pack + '.js');
-      })
-      .then(function () {
-        packSelect.value = pack; // Re-assert: belt-and-suspenders against the group script's own default-pack auto-load racing this.
-        loadBtn.click();
-        callback();
-      })
-      .catch(function () {
-        callback(); // Let the caller continue even if frame loading failed.
+    resolveFramePack('Margin', 'Margin-1', function () {
+      const loadBtn = document.querySelector('#loadFrameVersion');
+      if (loadBtn) loadBtn.click(); // Sets card.margins = true + adjusts artBounds — doesn't touch card.frames.
+
+      // applyManualFrameSelectionRobust (not the plain, one-shot version)
+      // because resolveFramePack's "skip the redundant reload" fast path
+      // (used here, since Margin-1 is the Margin group's own default pack)
+      // still leaves that original, auto-triggered internal pack load
+      // running asynchronously and outside our control — confirmed against
+      // the live site, it can finish well after our own selection already
+      // succeeded and silently revert it back to 'Black Extension' with
+      // nothing to notice or fix it otherwise.
+      applyManualFrameSelectionRobust(extensionName, function () {
+        // Retry-until-confirmed rather than trying to predict exactly when
+        // the main thread frees up: the base frame's own image
+        // fetch/decode/composite work can still be running here (confirmed
+        // against the live site — it measurably delays anything queued
+        // after it), so a first attempt can silently lose a race even
+        // after waitForFramesBuilt's settle check in loadBaseFrame. A
+        // fresh attempt once things actually quiet down reliably sticks
+        // (confirmed end-to-end against live production data).
+        let attempts = 0;
+        const intervalId = setInterval(function () {
+          attempts++;
+          const applied = !!(pageWindow.card && pageWindow.card.margins);
+          if (applied || attempts > 60) {
+            // ~12s per attempt.
+            clearInterval(intervalId);
+            if (applied) {
+              // card.margins flips true as soon as loadMarginVersion runs,
+              // well before the border-extension image addFrame() just
+              // queued has actually finished fetching/decoding/compositing
+              // (confirmed against the live site: a silver/borderless
+              // extension's true color only appeared on canvas a couple of
+              // seconds after margins went true, while black/white — likely
+              // smaller/already-cached images — looked done immediately).
+              // Reuse the same settle check as the base frame rather than
+              // just trusting the flag.
+              waitForFramesBuilt(function () {
+                setToolbarStatus('');
+              });
+            } else {
+              applyBleedMargin(scryfallCardData, attempt + 1);
+            }
+          }
+        }, 200);
       });
+    });
   }
 
   // ---- local export ------------------------------------------------------
