@@ -2152,6 +2152,51 @@
     anchorEl.appendChild(btn);
   }
 
+  // A literal <button> can't validly nest inside another <button> or an
+  // <a> — some card contexts (e.g. the site's printing-tag candidates,
+  // where data-card-* attributes are spread directly onto a react-bootstrap
+  // <Button>) match CARD_ROOT_SELECTOR on exactly such an element. Nesting
+  // a real <button> there is invalid HTML; browsers silently reparent it
+  // elsewhere in the DOM to fix that, completely decoupling its position
+  // from the card (it stops moving/scaling with it — e.g. on hover-zoom).
+  // A <span role="button"> is not "interactive content" per the HTML spec,
+  // so it nests validly — same class (all existing CSS/positioning still
+  // applies) and still caught by the delegated click handler below, which
+  // matches by class, not tag; only needs keyboard activation added by
+  // hand, since a real <button> gets that for free.
+  function createConjureTrigger(anchorEl) {
+    const mustAvoidNesting = !!anchorEl.closest('button, a');
+    const btn = document.createElement(mustAvoidNesting ? 'span' : 'button');
+    if (mustAvoidNesting) {
+      btn.setAttribute('role', 'button');
+      btn.setAttribute('tabindex', '0');
+      btn.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          btn.click();
+        }
+      });
+      // A click here would otherwise bubble into the real <button>/<a>
+      // we're nested inside — e.g. the site's printing-tag candidate
+      // buttons, whose own onClick submits a vote — and fire that too.
+      // Handled directly (not via the document-level delegated listener
+      // further down, which only sees this after it's already bubbled
+      // past that ancestor) so stopPropagation actually lands in time.
+      // handleConjureTrigger is a function declaration defined later in
+      // this same scope — hoisted, so it's already callable here.
+      btn.addEventListener('click', function (event) {
+        event.stopPropagation();
+        event.preventDefault();
+        handleConjureTrigger(btn);
+      });
+    } else {
+      btn.type = 'button';
+    }
+    btn.className = BUTTON_CLASS;
+    btn.textContent = '+ conjure';
+    return btn;
+  }
+
   function injectButtonIfNeeded(rootEl) {
     if (rootEl.hasAttribute(INJECTED_MARKER_ATTR)) {
       upgradeButtonAnchor(rootEl);
@@ -2179,10 +2224,7 @@
     }
     anchorEl.classList.add(BUTTON_ANCHOR_CLASS);
 
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = BUTTON_CLASS;
-    btn.textContent = '+ conjure';
+    const btn = createConjureTrigger(anchorEl);
     anchorEl.appendChild(btn);
     rootEl.setAttribute(INJECTED_MARKER_ATTR, '1');
   }
@@ -2408,10 +2450,11 @@
 
   // ---- click handling / postMessage -----------------------------------
 
-  document.body.addEventListener('click', function (event) {
-    const btn = event.target.closest ? event.target.closest('.' + BUTTON_CLASS) : null;
-    if (!btn) return;
-
+  // Shared by the delegated document-level listener below (the normal
+  // path) and by createConjureTrigger's own direct listener (the
+  // nested-inside-another-button path, which needs to intercept the click
+  // before it bubbles into that button's own handler — see there).
+  function handleConjureTrigger(btn) {
     const rootEl = btn.closest(CARD_ROOT_SELECTOR);
     if (!rootEl) return;
 
@@ -2423,6 +2466,12 @@
     }
 
     showArtSourcePopover(btn, cardData, rootEl, rootEl.getBoundingClientRect());
+  }
+
+  document.body.addEventListener('click', function (event) {
+    const btn = event.target.closest ? event.target.closest('.' + BUTTON_CLASS) : null;
+    if (!btn) return;
+    handleConjureTrigger(btn);
   });
 
   // ---- background upscale queue ------------------------------------------
