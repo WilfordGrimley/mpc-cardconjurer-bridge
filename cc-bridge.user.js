@@ -55,6 +55,13 @@
   const CARD_ROOT_SELECTOR = '[data-card-name], .mpccard';
   const BUTTON_CLASS = 'cc-bridge-btn';
   const BUTTON_ANCHOR_CLASS = 'cc-bridge-btn-anchor';
+  // Set alongside BUTTON_ANCHOR_CLASS specifically for the
+  // nested-inside-another-button case (see createConjureTrigger) — that's
+  // the site's printing-tag candidates today, whose own hover-zoom
+  // (the hover-zoom wrapper) is a deliberate exception to how every other card
+  // on the site behaves (border/label static, only the art scales) —
+  // the button should scale along with it there instead of staying put.
+  const BUTTON_ANCHOR_ZOOM_CLASS = 'cc-bridge-btn-anchor-zoom';
   const INJECTED_MARKER_ATTR = 'data-cc-bridge-injected';
   const RETRY_INTERVAL_MS = 250;
   const MAX_RETRIES = 20; // 250ms * 20 = 5s
@@ -1531,13 +1538,22 @@
     '  color: #ebebeb;' +
     '  cursor: pointer;' +
     '  opacity: 0;' +
-    '  transition: opacity 0.12s ease;' +
+    // transform's own timing (0.15s ease-out) matches the hover-zoom wrapper's
+    // img transition exactly (see BUTTON_ANCHOR_ZOOM_CLASS below), so the
+    // two visually stay in lockstep during the hover-zoom.
+    '  transition: opacity 0.12s ease, transform 0.15s ease-out;' +
     '}' +
     '.' + BUTTON_CLASS + ':hover { background: #3d8cd9; }' +
     // Shown only while hovering the card art itself (the button's
     // positioned parent, see BUTTON_ANCHOR_CLASS in injectButtonIfNeeded)
     // rather than always-on, so it doesn't clutter the grid.
     '.' + BUTTON_ANCHOR_CLASS + ':hover > .' + BUTTON_CLASS + ' { opacity: 1; }' +
+    // Everywhere else on the site, a card's border/label stay static
+    // while only its art zooms on hover — but the site's printing-tag
+    // candidates (the hover-zoom wrapper, `:hover img { transform: scale(1.6) }`)
+    // are a deliberate exception, so the button matches that exception
+    // here rather than the site-wide norm.
+    '.' + BUTTON_ANCHOR_ZOOM_CLASS + ':hover > .' + BUTTON_CLASS + ' { transform: scale(1.6); }' +
     '.cc-bridge-modal-backdrop {' +
     '  position: fixed; inset: 0; background: rgba(15,37,55,0.75);' +
     '  z-index: 999999;' +
@@ -2168,6 +2184,7 @@
     const mustAvoidNesting = !!anchorEl.closest('button, a');
     const btn = document.createElement(mustAvoidNesting ? 'span' : 'button');
     if (mustAvoidNesting) {
+      anchorEl.classList.add(BUTTON_ANCHOR_ZOOM_CLASS);
       btn.setAttribute('role', 'button');
       btn.setAttribute('tabindex', '0');
       btn.addEventListener('keydown', function (event) {
