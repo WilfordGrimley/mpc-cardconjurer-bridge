@@ -26,6 +26,7 @@
   const DEFAULT_CC_ORIGIN = 'http://localhost:4242';
   const DEFAULT_ENABLED_ORIGINS = [
     'https://mpcfill.com',
+    'https://proxyprints.ca',
     'http://localhost',
     'https://localhost',
     'http://127.0.0.1',
