@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.10.0
+// @version      0.11.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -107,6 +107,22 @@
     return !GM_getValue('driveClientId', '') && !!DEFAULT_DRIVE_CLIENT_ID;
   }
 
+  // Optional: a URL to the user's own ONNX super-resolution model weights
+  // (e.g. a Real-ESRGAN export), passed through to the Enlarger tool at
+  // handoff time so it can run real neural upscaling instead of its
+  // built-in classical (Lanczos) resampling fallback. Empty means
+  // Enlarger uses its own default/fallback behavior. Not a Tampermonkey
+  // file picker — GM storage isn't meant for tens-to-hundreds of MB model
+  // files — a URL the user hosts themselves (their own instance, same
+  // "bring your own" pattern as everything else configurable here).
+  function getUpscaleModelUrl() {
+    return GM_getValue('upscaleModelUrl', '');
+  }
+
+  function setUpscaleModelUrl(url) {
+    GM_setValue('upscaleModelUrl', url);
+  }
+
   function getEnabledOrigins() {
     return GM_getValue('enabledOrigins', []);
   }
@@ -188,6 +204,19 @@
     } else {
       alert('cc-bridge: cleared. No shared default is configured, so Drive export is now unavailable until you set a Client ID.');
     }
+  });
+
+  GM_registerMenuCommand('Configure upscale model weights (for Enlarger)', function () {
+    const current = getUpscaleModelUrl();
+    const input = prompt(
+      'URL to your own ONNX super-resolution model (e.g. a Real-ESRGAN export) for the Enlarger tool to use ' +
+        'instead of its built-in classical resampling. Must be reachable with CORS enabled from wherever you ' +
+        'host Enlarger. Leave blank to use Enlarger\'s own built-in fallback:',
+      current
+    );
+    if (input === null) return;
+    setUpscaleModelUrl(input.trim());
+    alert('cc-bridge: upscale model URL ' + (input.trim() ? 'saved.' : 'cleared — back to Enlarger\'s built-in fallback.'));
   });
 
   // ---- Card Conjurer receiver -------------------------------------------
