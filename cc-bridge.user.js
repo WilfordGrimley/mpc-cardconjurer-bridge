@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.19.0
+// @version      0.20.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -1776,8 +1776,21 @@
   // an art-layer source for the full-art/borderless flow below, which
   // wants exactly that: the whole finished card image, upscaled and
   // placed to fill the larger full-art/borderless art window.
+  //
+  // Falls back to the first <img> anywhere in rootEl if img.card-img isn't
+  // present — CARD_ROOT_SELECTOR's own `[data-card-name]` half also
+  // matches the site's printing-tag candidate buttons (the printing-tag candidate list/
+  // the printing-tag candidate picker's its own attribute helper), whose art is
+  // a plain <img src={candidate.smallThumbnailUrl}> with no card-img class
+  // at all, styled-components-wrapped instead of the main grid's markup.
+  // Confirmed as the actual cause of a real report: a borderless card
+  // (TLE 316, Sol Ring) imported with the correct frame (full_art/
+  // border_color came through fine via the Scryfall fetch, independent of
+  // this DOM) but no image at all, conjured from that page specifically —
+  // img.card-img matched nothing there, so this returned null and the
+  // full-art flow had nothing to upscale.
   function extractCardArtUrl(rootEl) {
-    const img = rootEl.querySelector('img.card-img');
+    const img = rootEl.querySelector('img.card-img') || rootEl.querySelector('img');
     return img && img.src ? img.src : null;
   }
 
