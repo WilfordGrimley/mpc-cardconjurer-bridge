@@ -8,6 +8,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
 // @run-at       document-idle
 // @license      MIT
 // ==/UserScript==
@@ -22,6 +23,16 @@
 
 (function () {
   'use strict';
+
+  // Firefox's userscript sandbox (Xray wrappers) hides variables/functions a
+  // page's own script defines from a plain `window` reference inside a
+  // userscript — Chrome is more permissive, which is why this only shows up
+  // on Firefox. `card`, `importChanged`, `cardCanvas`, and
+  // `loadMarginVersion` below are all Card Conjurer's own globals (defined
+  // by creator-23.js/groupMargin.js), not this script's — unsafeWindow is
+  // required to actually see them. Native browser APIs (showDirectoryPicker,
+  // indexedDB) aren't affected by this and are read via plain `window`.
+  const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   const DEFAULT_CC_ORIGIN = 'http://localhost:4242';
   const DEFAULT_ENABLED_ORIGINS = [
@@ -197,10 +208,10 @@
     // has actually loaded one in. This is the real precondition, confirmed
     // against the live site: importChanged existing was not sufficient.
     return (
-      typeof window.importChanged === 'function' &&
-      window.card &&
-      window.card.text &&
-      window.card.text.title
+      typeof pageWindow.importChanged === 'function' &&
+      pageWindow.card &&
+      pageWindow.card.text &&
+      pageWindow.card.text.title
     );
   }
 
@@ -322,7 +333,7 @@
     const loadBtn = document.querySelector('#loadFrameVersion');
     if (!groupSelect || !loadBtn) return; // Degrade silently, as elsewhere.
 
-    if (window.card && window.card.margins) return; // Already applied.
+    if (pageWindow.card && pageWindow.card.margins) return; // Already applied.
 
     groupSelect.value = 'Margin';
     groupSelect.dispatchEvent(new Event('change', { bubbles: true }));
@@ -342,7 +353,7 @@
         // Load Frame Version, same reasoning as waitForImportReady above.
         waitForCondition(
           function () {
-            return typeof window.loadMarginVersion === 'function';
+            return typeof pageWindow.loadMarginVersion === 'function';
           },
           function () {
             loadBtn.click();
@@ -506,7 +517,7 @@
   }
 
   async function exportCard(cardData) {
-    const canvas = window.cardCanvas;
+    const canvas = pageWindow.cardCanvas;
     if (!canvas) {
       alert('cc-bridge: no card canvas found — is a card loaded?');
       return;
