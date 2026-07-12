@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.14.0
+// @version      0.15.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -269,6 +269,12 @@
   // return too.
   let pendingCustomArtBlob = null;
 
+  // Tracks the currently-open "Reimport art…" popover inside Card
+  // Conjurer's own toolbar — same TDZ-safe placement as the three above,
+  // since showReimportPopover/closeReimportPopover (which read/write this)
+  // live after the early return too.
+  let reimportPopoverEl = null;
+
   if (location.origin === getCCOrigin()) {
     // Only reskin when actually embedded via our own modal — a user who
     // separately has this script installed and visits Card Conjurer
@@ -330,6 +336,19 @@
         } else {
           setDriveToolbarStatus('');
           alert('cc-bridge: Google Drive upload failed — ' + (data.message || 'unknown error'));
+        }
+        return;
+      }
+
+      // Reply to our own reimport request (see sendReimportRequest) — the
+      // sender page ran the actual upscale and is handing back the
+      // result to apply over the current art.
+      if (data && data.type === 'cc-bridge-reimport-result') {
+        if (data.blob && typeof pageWindow.uploadArt === 'function') {
+          applyCustomArtRobust(URL.createObjectURL(data.blob), 4);
+          setToolbarStatus('Reimported.');
+        } else {
+          setToolbarStatus('Reimport failed — no image came back.');
         }
         return;
       }
@@ -1201,7 +1220,102 @@
     });
     toolbar.appendChild(driveBtn);
 
+    // Minimal — redoing the art-source choice mid-session (without losing
+    // whatever frame/text edits are already in progress by closing and
+    // reopening the whole modal from scratch), not a full copy of
+    // Enlarger's former control surface.
+    const reimportBtn = document.createElement('button');
+    reimportBtn.type = 'button';
+    reimportBtn.className = 'cc-bridge-toolbar-btn';
+    reimportBtn.textContent = 'Reimport art…';
+    reimportBtn.addEventListener('click', function () {
+      showReimportPopover(reimportBtn);
+    });
+    toolbar.appendChild(reimportBtn);
+
     document.body.appendChild(toolbar);
+  }
+
+  // ---- reimport art mid-session (relays through the sender page) --------
+  //
+  // The actual upscale (upscaleViaEnlarger, ENLARGER_HTML) only exists in
+  // the sender/host page's own code path — this receiver code path
+  // returned early long before that's ever defined, they're the same
+  // script file but never the same running context. So this asks the
+  // parent to do it and waits for the result, rather than duplicating the
+  // upscale machinery here.
+
+  function closeReimportPopover() {
+    if (reimportPopoverEl && reimportPopoverEl.parentNode) reimportPopoverEl.parentNode.removeChild(reimportPopoverEl);
+    reimportPopoverEl = null;
+    document.removeEventListener('click', onReimportPopoverOutsideClick, true);
+  }
+
+  function onReimportPopoverOutsideClick(event) {
+    if (reimportPopoverEl && !reimportPopoverEl.contains(event.target) && event.target !== event.currentTarget) {
+      closeReimportPopover();
+    }
+  }
+
+  function showReimportPopover(anchorBtn) {
+    closeReimportPopover();
+    const rect = anchorBtn.getBoundingClientRect();
+    const pop = document.createElement('div');
+    pop.className = 'cc-bridge-art-popover';
+    pop.style.top = rect.bottom + 4 + 'px';
+    pop.style.left = Math.max(4, rect.left) + 'px';
+
+    const scryfallOpt = document.createElement('button');
+    scryfallOpt.type = 'button';
+    scryfallOpt.className = 'cc-bridge-art-popover-opt';
+    scryfallOpt.textContent = 'Use Scryfall art';
+    scryfallOpt.addEventListener('click', function () {
+      closeReimportPopover();
+      const scryfallCardData = getSelectedScryfallCard();
+      const artUrl = scryfallCardData && scryfallCardData.image_uris && scryfallCardData.image_uris.art_crop;
+      if (!artUrl || !senderOrigin) {
+        setToolbarStatus('No Scryfall art available to reimport.');
+        return;
+      }
+      sendReimportRequest({ artUrl: artUrl });
+    });
+
+    const uploadOpt = document.createElement('button');
+    uploadOpt.type = 'button';
+    uploadOpt.className = 'cc-bridge-art-popover-opt';
+    uploadOpt.textContent = 'Upload my own image…';
+    uploadOpt.addEventListener('click', function () {
+      closeReimportPopover();
+      const fileInput = document.createElement('input');
+      fileInput.type = 'file';
+      fileInput.accept = 'image/*';
+      fileInput.style.display = 'none';
+      document.body.appendChild(fileInput);
+      fileInput.addEventListener('change', function () {
+        const file = fileInput.files[0];
+        fileInput.remove();
+        if (!file || !senderOrigin) return;
+        sendReimportRequest({ file: file });
+      });
+      fileInput.click();
+    });
+
+    pop.appendChild(scryfallOpt);
+    pop.appendChild(uploadOpt);
+    document.body.appendChild(pop);
+    reimportPopoverEl = pop;
+
+    setTimeout(function () {
+      document.addEventListener('click', onReimportPopoverOutsideClick, true);
+    }, 0);
+  }
+
+  function sendReimportRequest(source) {
+    setToolbarStatus('Upscaling…');
+    const payload = { type: 'cc-bridge-reimport-request' };
+    if (source.artUrl) payload.artUrl = source.artUrl;
+    if (source.file) payload.file = source.file;
+    window.parent.postMessage(payload, senderOrigin);
   }
 
   function setToolbarStatus(text) {
@@ -1964,6 +2078,32 @@
   }
 
   window.addEventListener('message', handleDriveExportMessage);
+
+  // Reimport-mid-session requests from inside an already-open Card
+  // Conjurer panel (see sendReimportRequest/showReimportPopover in the
+  // receiver section) — runs the same upscale pass as the initial
+  // art-source choice, just triggered later instead of before Card
+  // Conjurer opens.
+  function handleReimportRequestMessage(event) {
+    if (event.origin !== getCCOrigin()) return;
+    const data = event.data;
+    if (!data || data.type !== 'cc-bridge-reimport-request') return;
+    if (!data.artUrl && !data.file) return;
+
+    function reply(blob) {
+      if (event.source) {
+        event.source.postMessage({ type: 'cc-bridge-reimport-result', blob: blob || null }, event.origin);
+      }
+    }
+
+    upscaleViaEnlarger(data.artUrl ? { url: data.artUrl } : { file: data.file }, function (blob) {
+      // Same fall-back-to-raw-upload discipline as the initial art-source
+      // choice — the user's explicit reimport request shouldn't be
+      // dropped just because the upscale pass itself failed.
+      reply(blob || data.file || null);
+    });
+  }
+  window.addEventListener('message', handleReimportRequestMessage);
 
   function showDriveToast(message, isError) {
     let toast = document.querySelector('.cc-bridge-drive-toast');
