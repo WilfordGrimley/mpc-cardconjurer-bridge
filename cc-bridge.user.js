@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.6.0
+// @version      0.7.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -165,8 +165,40 @@
   let currentCardData = null;
 
   if (location.origin === getCCOrigin()) {
+    // Only reskin when actually embedded via our own modal — a user who
+    // separately has this script installed and visits Card Conjurer
+    // directly on its own tab should see Card Conjurer's own real theme,
+    // not have it silently overridden.
+    if (window.parent !== window) applyMpcfillTheme();
     setupCCReceiver();
     return;
+  }
+
+  // Card Conjurer's entire visual theme runs through ~9 CSS custom
+  // properties on :root (confirmed by reading style-9.css directly —
+  // --color-primary/--color-selected/--color-highlight/--font-color/
+  // --font-color-2/--input-background/--input-background-selected feed
+  // every themed selector in the file) plus a couple of hard-coded values
+  // on html/.background that aren't var()-driven. Overriding just these
+  // gives a complete, coherent reskin without fighting individual
+  // selectors — and never touches the card canvas/rendering itself, only
+  // the surrounding application chrome. Colors are the site's real
+  // computed theme (--bs-primary/--bs-body-bg/etc.), not guessed.
+  function applyMpcfillTheme() {
+    const style = document.createElement('style');
+    style.textContent =
+      ':root {' +
+      '  --color-primary: #4c9be8;' +
+      '  --color-selected: #7ab8ec;' +
+      '  --color-highlight: #4c9be8;' +
+      '  --font-color: #ebebeb;' +
+      '  --font-color-2: #abb6c2;' +
+      '  --input-background: #20374c;' +
+      '  --input-background-selected: #2d4a63;' +
+      '}' +
+      'html { background: #0f2537 !important; }' +
+      '.background { background: #0f2537 !important; }';
+    document.documentElement.appendChild(style);
   }
 
   function setupCCReceiver() {
@@ -916,14 +948,14 @@
       '  display: flex; gap: 6px;' +
       '}' +
       '.cc-bridge-toolbar-btn {' +
-      '  font-size: 12px; padding: 6px 10px; border-radius: 4px;' +
-      '  border: 1px solid rgba(0,0,0,0.3); background: rgba(255,255,255,0.95);' +
-      '  color: #222; cursor: pointer;' +
+      '  font-size: 12px; padding: 6px 10px; border-radius: 2px;' +
+      '  border: 1px solid #4c9be8; background: #4c9be8;' +
+      '  color: #ebebeb; cursor: pointer;' +
       '}' +
-      '.cc-bridge-toolbar-btn:hover { background: #fff; }' +
+      '.cc-bridge-toolbar-btn:hover { background: #3d8cd9; }' +
       '.cc-bridge-toolbar-status {' +
-      '  font-size: 12px; padding: 6px 4px; color: #fff; background: rgba(0,0,0,0.6);' +
-      '  border-radius: 4px; align-self: center;' +
+      '  font-size: 12px; padding: 6px 4px; color: #ebebeb; background: rgba(15,37,55,0.8);' +
+      '  border-radius: 2px; align-self: center;' +
       '}' +
       '.cc-bridge-toolbar-status:empty { display: none; }';
     document.documentElement.appendChild(toolbarStyle);
@@ -973,6 +1005,10 @@
 
   // ---- styles -------------------------------------------------------
 
+  // Colors below are the site's own real computed theme (read directly
+  // off the live site: --bs-primary/--bs-body-bg/--bs-dark/etc.), not a
+  // guess — the injected button and modal chrome are meant to look like
+  // they belong to that page, not to Card Conjurer or to this script.
   const style = document.createElement('style');
   style.textContent =
     '.' + BUTTON_CLASS + ' {' +
@@ -982,31 +1018,39 @@
     '  z-index: 10;' +
     '  font-size: 11px;' +
     '  line-height: 1;' +
-    '  padding: 3px 6px;' +
-    '  border: 1px solid rgba(0,0,0,0.3);' +
-    '  border-radius: 4px;' +
-    '  background: rgba(255,255,255,0.9);' +
-    '  color: #222;' +
+    '  padding: 4px 7px;' +
+    '  border: 1px solid #4c9be8;' +
+    '  border-radius: 2px;' +
+    '  background: #4c9be8;' +
+    '  color: #ebebeb;' +
     '  cursor: pointer;' +
     '}' +
-    '.' + BUTTON_CLASS + ':hover { background: #fff; }' +
+    '.' + BUTTON_CLASS + ':hover { background: #3d8cd9; }' +
     '.cc-bridge-modal-backdrop {' +
-    '  position: fixed; inset: 0; background: rgba(0,0,0,0.6);' +
-    '  z-index: 999999; display: flex; align-items: center; justify-content: center;' +
+    '  position: fixed; inset: 0; background: rgba(15,37,55,0.75);' +
+    '  z-index: 999999;' +
     '}' +
+    // position/left/top/width/height are set as inline styles (see
+    // openEditorModal) and transitioned between the clicked card's own
+    // rect and the panel's full working size — position: fixed throughout
+    // both states, not just relative-then-fixed, so the transition is a
+    // smooth resize/reposition rather than a mode-switch snap.
     '.cc-bridge-modal-panel {' +
-    '  position: relative; width: 92vw; height: 92vh; max-width: 1400px;' +
-    '  background: #fff; border-radius: 8px; overflow: hidden;' +
+    '  position: fixed;' +
+    '  background: #0f2537; border-radius: 2px; overflow: hidden;' +
     '  box-shadow: 0 10px 40px rgba(0,0,0,0.5);' +
+    '  border: 1px solid #20374c;' +
+    '  transition: left 0.32s cubic-bezier(0.2, 0.7, 0.3, 1), top 0.32s cubic-bezier(0.2, 0.7, 0.3, 1),' +
+    '    width 0.32s cubic-bezier(0.2, 0.7, 0.3, 1), height 0.32s cubic-bezier(0.2, 0.7, 0.3, 1);' +
     '}' +
     '.cc-bridge-modal-iframe { width: 100%; height: 100%; border: 0; display: block; }' +
     '.cc-bridge-modal-close {' +
     '  position: absolute; top: 8px; right: 8px; z-index: 1;' +
     '  width: 32px; height: 32px; border-radius: 50%; border: none;' +
-    '  background: rgba(0,0,0,0.6); color: #fff; font-size: 18px; line-height: 1;' +
+    '  background: #4c9be8; color: #ebebeb; font-size: 18px; line-height: 1;' +
     '  cursor: pointer;' +
     '}' +
-    '.cc-bridge-modal-close:hover { background: rgba(0,0,0,0.8); }';
+    '.cc-bridge-modal-close:hover { background: #3d8cd9; }';
   document.documentElement.appendChild(style);
 
   // ---- card data extraction ------------------------------------------
@@ -1107,14 +1151,14 @@
       cardData = mergeCardSelectedDetail(cardData, lastCardSelectedDetail);
     }
 
-    openEditorModal(cardData);
+    openEditorModal(cardData, rootEl.getBoundingClientRect());
   });
 
   // Only one editor modal at a time; tracks the previous instance's own
   // cleanup so a second "+ conjure" click replaces rather than stacks.
   let closeCurrentModal = null;
 
-  function openEditorModal(cardData) {
+  function openEditorModal(cardData, originRect) {
     if (closeCurrentModal) closeCurrentModal();
 
     const ccOrigin = getCCOrigin();
@@ -1124,6 +1168,29 @@
 
     const panel = document.createElement('div');
     panel.className = 'cc-bridge-modal-panel';
+
+    // The panel is position: fixed for its entire life (see the .panel
+    // class above) — both the starting and final rects below are plain
+    // pixel values in that same coordinate space, so the CSS transition
+    // between them is a smooth resize/move rather than a layout-mode
+    // snap. Anchoring the opening rect to the card that was actually
+    // clicked reads as the editor growing out of that card, rather than
+    // an unrelated dialog appearing over the page.
+    const finalWidth = Math.min(window.innerWidth * 0.92, 1400);
+    const finalHeight = window.innerHeight * 0.92;
+    const finalLeft = (window.innerWidth - finalWidth) / 2;
+    const finalTop = (window.innerHeight - finalHeight) / 2;
+
+    function setPanelRect(rect) {
+      panel.style.left = rect.left + 'px';
+      panel.style.top = rect.top + 'px';
+      panel.style.width = rect.width + 'px';
+      panel.style.height = rect.height + 'px';
+    }
+
+    setPanelRect(
+      originRect || { left: finalLeft, top: finalTop, width: finalWidth, height: finalHeight }
+    );
 
     const closeBtn = document.createElement('button');
     closeBtn.type = 'button';
@@ -1138,6 +1205,16 @@
     panel.appendChild(closeBtn);
     panel.appendChild(iframe);
     backdrop.appendChild(panel);
+
+    if (originRect) {
+      // Force layout with the starting rect applied before switching to
+      // the final size, so the browser has something to transition from.
+      // eslint-disable-next-line no-unused-expressions
+      panel.getBoundingClientRect();
+      requestAnimationFrame(function () {
+        setPanelRect({ left: finalLeft, top: finalTop, width: finalWidth, height: finalHeight });
+      });
+    }
 
     let intervalId = null;
 
