@@ -801,8 +801,20 @@
     }, 100);
   }
 
+  // attributes: true is required, not just childList — ProxyPrints omits
+  // data-card-name entirely while a card is still resolving (per its own
+  // dom-api.md), adding it later via an attribute change on the *same* DOM
+  // node rather than inserting a new one. childList alone would only ever
+  // see that node once, while it's still attribute-less, and never rescan
+  // it once the real data lands. attributeFilter keeps this from also
+  // firing on our own injected marker/style attributes.
   const observer = new MutationObserver(scheduleRescan);
-  observer.observe(document.body, { subtree: true, childList: true });
+  observer.observe(document.body, {
+    subtree: true,
+    childList: true,
+    attributes: true,
+    attributeFilter: ['data-card-name', 'alt'],
+  });
 
   scanForCards();
 })();
