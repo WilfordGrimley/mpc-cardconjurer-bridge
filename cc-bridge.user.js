@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.8.0
+// @version      0.8.1
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -1022,6 +1022,16 @@
               setToolbarStatus('Google Drive connection failed or was cancelled.');
             }
           },
+          // Without this, a genuine failure (popup blocked, network error
+          // during the OAuth handshake) has nowhere to go — only the
+          // success/cancel path above was reachable. ProxyPrints' own
+          // equivalent (googleDriveAuth.ts, commit 1c4d2c0e) wires this
+          // explicitly; adopted the same fix here.
+          error_callback: function (error) {
+            setToolbarStatus('');
+            const message = error && error.message ? error.message : String(error);
+            alert('cc-bridge: Google Drive connection failed — ' + message);
+          },
         });
       }
       driveTokenClient.requestAccessToken();
@@ -1059,7 +1069,11 @@
       form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
       form.append('file', blob);
 
-      fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+      // &fields=id trims Google's response to just the file id instead of
+      // the full file resource — small, free saving, matching the same
+      // call in ProxyPrints' uploadFile (GoogleDriveService.ts, commit
+      // 1c4d2c0e).
+      fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', {
         method: 'POST',
         headers: { Authorization: 'Bearer ' + driveAccessToken },
         body: form,
