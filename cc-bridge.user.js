@@ -1513,10 +1513,13 @@
     // width: 100%; height: 100% }` — a rule that targets *any* direct
     // child, including this button, and was still winning over a plain
     // (non-!important) override here, ballooning the button to the full
-    // size of the card. !important forces our sizing to actually stick.
+    // size of the card. !important forces its natural, content-sized
+    // dimensions (padding + font-size below) to actually stick, same as
+    // it always sized when it lived on the card header/tile — no
+    // Bootstrap rule competed for width/height there.
     '  left: auto !important;' +
-    '  width: 5% !important;' +
-    '  height: 5% !important;' +
+    '  width: auto !important;' +
+    '  height: auto !important;' +
     '  max-width: none !important;' +
     '  z-index: 10;' +
     '  font-size: 11px;' +
