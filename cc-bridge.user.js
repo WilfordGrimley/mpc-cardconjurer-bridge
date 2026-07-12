@@ -2775,13 +2775,26 @@
     if (!referenceLink) return; // Not a recognized nav structure — degrade silently, no tab.
     const container = referenceLink.parentElement;
 
+    // A real href here (even "#") lets the host site's own client-side
+    // router grab the click — routers commonly delegate on a[href] at the
+    // document level, in the capture phase, ahead of our own listener on
+    // the tab — and navigate the page out from under the user (observed:
+    // the address bar gets overwritten with the site's own printing-queue
+    // route). No href at all means the router has nothing to match.
     const tab = document.createElement('a');
-    tab.href = '#';
     tab.className = referenceLink.className + ' cc-bridge-queue-tab';
+    tab.setAttribute('role', 'button');
+    tab.tabIndex = 0;
     updateQueueTabLabel(tab);
     tab.addEventListener('click', function (event) {
       event.preventDefault();
       toggleQueuePanel(tab);
+    });
+    tab.addEventListener('keydown', function (event) {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        toggleQueuePanel(tab);
+      }
     });
     container.appendChild(tab);
 
