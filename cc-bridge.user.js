@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.4.0
+// @version      0.5.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -275,6 +275,7 @@
     if (!importIndex) {
       setTimeout(function () {
         refreshAutoFrame();
+        setToolbarStatus('Applying bleed margin…');
         applyBleedMargin();
       }, 1200);
       return;
@@ -285,8 +286,13 @@
       if (wantsSpecificPrint) {
         selectMatchingPrint(importIndex, cardData);
       }
-      refreshAutoFrame();
-      applyBleedMargin();
+      setToolbarStatus('Building frame…');
+      loadBaseFrame(getSelectedScryfallCard(), function () {
+        // No separate refreshAutoFrame() call needed here — setAutoFrame()
+        // inside loadBaseFrame already set #autoFrame and dispatched its
+        // change event, which is what actually builds card.frames.
+        applyBleedMargin();
+      });
     });
     observer.observe(importIndex, { childList: true });
     // Safety net in case the Scryfall fetch never resolves (network error, etc).
@@ -309,11 +315,141 @@
   }
 
   function refreshAutoFrame() {
-    // Re-run CC's own auto-frame builder (crown/PT-box/color accuracy) now
-    // that real card data has been imported. Only if the user already opted
-    // into auto-frame styling — this never picks a frame style on its own.
+    // Degraded-markup fallback only (see the #import-index null-check
+    // above) — without access to the imported Scryfall data there, this
+    // can't make an informed frame choice, so it only re-runs CC's own
+    // auto-frame builder if the user already had one configured, rather
+    // than picking a frame on its own. The normal path (loadBaseFrame's
+    // setAutoFrame) does pick one, using real card data.
     const autoFrameSelect = document.querySelector('#autoFrame');
     if (!autoFrameSelect || autoFrameSelect.value === 'false') return;
+    autoFrameSelect.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  // ---- base frame selection ---------------------------------------------
+  //
+  // The bleed margin (below) layers a border *onto* whatever frame is
+  // already loaded — without a base frame first, there's nothing under it
+  // to render. Picks a default group+pack from the same Scryfall data Card
+  // Conjurer's own import already fetched (layout/type_line) — not Scryfall
+  // Tagger, a separate unofficial API with sparse, community-curated tag
+  // coverage that nothing here calls. Only the structurally-necessary
+  // distinctions are handled: a Saga literally needs Saga frame elements to
+  // render at all, unlike a purely cosmetic choice (showcase, extended art),
+  // where the regular frame still renders a complete, correct-looking card.
+  //
+  // Clicking #loadFrameVersion (via loadFramePack below) only sets up
+  // metadata — art bounds, text fields, card.version — confirmed by reading
+  // several pack scripts directly; none of them touch card.frames. The
+  // actual frame *images* (and legendary crowns/PT boxes) only get added by
+  // autoFrame() (autoFrame.js), which reads #autoFrame's value. That
+  // dropdown only has entries for the "Regular"-style frame family
+  // (M15Regular-1, UB, Borderless, etc.) — Saga/Planeswalker/Modal/
+  // Transform/Token have no corresponding #autoFrame option, so for those,
+  // this still falls back to M15Regular-1 for the frame graphics (better
+  // than a completely blank card) even though the group/pack chosen above
+  // sets up the structurally-correct art bounds/text fields for the real
+  // layout. A real per-layout autoFrame equivalent for those, if one
+  // exists, wasn't found in the time available here.
+
+  function determineFrameSelection(scryfallCardData) {
+    if (!scryfallCardData) return null;
+    const layout = scryfallCardData.layout || '';
+    const typeLine = scryfallCardData.type_line || '';
+
+    if (layout === 'saga') return { group: 'Saga-1', pack: 'SagaRegular', autoFrame: null };
+    if (typeLine.indexOf('Planeswalker') !== -1) {
+      return { group: 'Planeswalker', pack: 'PlaneswalkerRegular', autoFrame: null };
+    }
+    if (layout === 'modal_dfc') return { group: 'Modal-1', pack: 'ModalRegular', autoFrame: null };
+    // Front face only — a transform card's back face isn't part of this
+    // import (MPC Autofill sources front/back as separate card slots).
+    if (layout === 'transform') return { group: 'DFC', pack: 'M15TransformFront', autoFrame: null };
+    if (layout === 'token' || typeLine.indexOf('Token') !== -1) {
+      return { group: 'Token-2', pack: 'TokenRegular-1', autoFrame: null };
+    }
+
+    // Structurally still a normal card either way — full_art/border_color
+    // only change which #autoFrame frame graphics get built, not the text
+    // field layout, so group/pack stay the same as the plain default below.
+    // Legendary crowns etc. aren't handled here at all: autoFrame()'s own
+    // buildAutoFrames() already detects "legendary"/"snow"/nyx-enchantment
+    // straight from the type line and adds them automatically, for any of
+    // these frame choices (confirmed: Borderless and FullArtNew both have
+    // supportsCrown: true in autoFrame.js) — no extra logic needed here.
+    if (scryfallCardData.full_art) {
+      return { group: 'Standard-3', pack: 'M15Regular-1', autoFrame: 'FullArtNew' };
+    }
+    if (scryfallCardData.border_color === 'borderless') {
+      return { group: 'Standard-3', pack: 'M15Regular-1', autoFrame: 'Borderless' };
+    }
+
+    return { group: 'Standard-3', pack: 'M15Regular-1', autoFrame: 'M15Regular-1' };
+  }
+
+  function getSelectedScryfallCard() {
+    const importIndex = document.querySelector('#import-index');
+    const scryfallCard = pageWindow.scryfallCard;
+    if (!importIndex || !Array.isArray(scryfallCard)) return null;
+    return scryfallCard[importIndex.value] || null;
+  }
+
+  function loadBaseFrame(scryfallCardData, callback) {
+    const selection = determineFrameSelection(scryfallCardData);
+    if (!selection) {
+      callback(); // No Scryfall data to key off; let the caller carry on frameless.
+      return;
+    }
+    loadFramePack(selection.group, selection.pack, function () {
+      setAutoFrame(selection.autoFrame || 'M15Regular-1');
+      waitForFramesBuilt(callback);
+    });
+  }
+
+  function waitForFramesBuilt(callback) {
+    // setAutoFrame's dispatched change event runs autoFrame(), which builds
+    // card.frames asynchronously. card.frames.length > 0 only means the
+    // array got populated with frame *references* — the real frame image
+    // fetch/decode/canvas-composite work for each one is still in flight
+    // at that point and can measurably take several more seconds (confirmed
+    // against the live site via network timing: a single frame image's
+    // response alone took ~2s, and since JS is single-threaded, that work
+    // blocks anything queued after it, including the *next* step's own
+    // loadScript() onload from firing — proceeding to applyBleedMargin
+    // immediately after frames.length > 0 measured a ~10s stall there
+    // purely from queueing behind this). Poll until frames.length is
+    // non-zero *and* stops changing across a few consecutive checks, as a
+    // proxy for "settled", with a generous bound since this can genuinely
+    // take a while.
+    let attempts = 0;
+    let stableTicks = 0;
+    let lastLength = -1;
+    const intervalId = setInterval(function () {
+      attempts++;
+      const frames = pageWindow.card && pageWindow.card.frames;
+      const length = Array.isArray(frames) ? frames.length : 0;
+      if (length > 0 && length === lastLength) {
+        stableTicks++;
+      } else {
+        stableTicks = 0;
+      }
+      lastLength = length;
+      if (stableTicks >= 3 || attempts > 150) {
+        // 3 stable ticks (~600ms unchanged) or ~30s given up either way.
+        clearInterval(intervalId);
+        callback();
+      }
+    }, 200);
+  }
+
+  function setAutoFrame(value) {
+    const autoFrameSelect = document.querySelector('#autoFrame');
+    if (!autoFrameSelect) return;
+    const hasOption = Array.prototype.some.call(autoFrameSelect.options, function (o) {
+      return o.value === value;
+    });
+    if (!hasOption) return; // Degrade silently rather than pick an arbitrary option.
+    autoFrameSelect.value = value;
     autoFrameSelect.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
@@ -323,63 +459,85 @@
   // group (#selectFrameGroup value 'Margin'), not a checkbox. Selecting it
   // loads /js/frames/groupMargin.js, which populates #selectFramePack with
   // several themed packs plus a generic one ({name:'Generic Margins',
-  // value:'Margin-1'}). Selecting a pack loads its own script; the frame is
-  // actually applied by clicking #loadFrameVersion (confirmed as the real
-  // trigger — CC's own code does exactly this elsewhere:
-  // document.querySelector('#loadFrameVersion').click()).
+  // value:'Margin-1'}).
 
-  function applyBleedMargin() {
-    const groupSelect = document.querySelector('#selectFrameGroup');
-    const loadBtn = document.querySelector('#loadFrameVersion');
-    if (!groupSelect || !loadBtn) return; // Degrade silently, as elsewhere.
-
-    if (pageWindow.card && pageWindow.card.margins) return; // Already applied.
-
-    groupSelect.value = 'Margin';
-    groupSelect.dispatchEvent(new Event('change', { bubbles: true }));
-
-    waitForCondition(
-      function () {
-        const packSelect = document.querySelector('#selectFramePack');
-        return packSelect && packSelect.querySelector('option[value="Margin-1"]');
-      },
-      function () {
-        const packSelect = document.querySelector('#selectFramePack');
-        packSelect.value = 'Margin-1';
-        packSelect.dispatchEvent(new Event('change', { bubbles: true }));
-
-        // The pack selection loads another script asynchronously; wait for
-        // it to actually register something for Margin-1 before clicking
-        // Load Frame Version, same reasoning as waitForImportReady above.
-        waitForCondition(
-          function () {
-            return typeof pageWindow.loadMarginVersion === 'function';
-          },
-          function () {
-            loadBtn.click();
-          },
-          30 // ~3s
-        );
-      },
-      30 // ~3s
-    );
-  }
-
-  function waitForCondition(isReady, callback, maxAttempts) {
-    if (isReady()) {
-      callback();
+  function applyBleedMargin(attempt) {
+    attempt = attempt || 1;
+    if (pageWindow.card && pageWindow.card.margins) {
+      setToolbarStatus('');
+      return; // Already applied.
+    }
+    if (attempt > 6) {
+      // Give up after a generous number of tries. Verified against the live
+      // site that this genuinely does complete given enough wall-clock time
+      // (Card Conjurer's own frame compositing runs on the single JS main
+      // thread and can take tens of seconds under contention) — this cap
+      // exists only to avoid polling forever if something is actually wrong.
+      setToolbarStatus('Bleed margin failed to apply — try "Export card" anyway or reload.');
       return;
     }
-    let attempts = 0;
-    const intervalId = setInterval(function () {
-      attempts++;
-      if (isReady()) {
-        clearInterval(intervalId);
+    setToolbarStatus('Applying bleed margin…');
+
+    loadFramePack('Margin', 'Margin-1', function () {
+      // Retry-until-confirmed rather than trying to predict exactly when
+      // the main thread frees up: the base frame's own image
+      // fetch/decode/composite work can still be running here (confirmed
+      // against the live site — it measurably delays anything queued after
+      // it, including this click's own async handler), so a first attempt
+      // can silently lose a race even after waitForFramesBuilt's settle
+      // check above. A fresh attempt once things actually quiet down
+      // reliably sticks (confirmed end-to-end against live production data).
+      let attempts = 0;
+      const intervalId = setInterval(function () {
+        attempts++;
+        const applied = !!(pageWindow.card && pageWindow.card.margins);
+        if (applied || attempts > 60) {
+          // ~12s per attempt.
+          clearInterval(intervalId);
+          if (applied) {
+            setToolbarStatus('');
+          } else {
+            applyBleedMargin(attempt + 1);
+          }
+        }
+      }, 200);
+    });
+  }
+
+  // Shared by base-frame and bleed-margin loading: selecting a frame group
+  // loads /js/frames/group<X>.js (populates #selectFramePack), selecting a
+  // pack loads /js/frames/pack<X>.js (wires up #loadFrameVersion's onclick
+  // for that specific pack — confirmed by reading several pack scripts;
+  // every one of them ends with exactly this assignment), and the frame is
+  // actually applied by clicking #loadFrameVersion. Rather than poll for
+  // some pack-specific side effect (which isn't a generalizable signal —
+  // different packs define different globals, if any), this calls Card
+  // Conjurer's own loadScript() directly and awaits its real promise
+  // (resolves on the underlying <script> tag's onload), the same function
+  // the page's own onchange handlers use internally.
+  function loadFramePack(group, pack, callback) {
+    const groupSelect = document.querySelector('#selectFrameGroup');
+    const packSelect = document.querySelector('#selectFramePack');
+    const loadBtn = document.querySelector('#loadFrameVersion');
+    if (!groupSelect || !packSelect || !loadBtn || typeof pageWindow.loadScript !== 'function') {
+      callback(); // Degrade silently, as elsewhere.
+      return;
+    }
+    groupSelect.value = group;
+    pageWindow
+      .loadScript('/js/frames/group' + group + '.js')
+      .then(function () {
+        packSelect.value = pack;
+        return pageWindow.loadScript('/js/frames/pack' + pack + '.js');
+      })
+      .then(function () {
+        packSelect.value = pack; // Re-assert: belt-and-suspenders against the group script's own default-pack auto-load racing this.
+        loadBtn.click();
         callback();
-      } else if (attempts > maxAttempts) {
-        clearInterval(intervalId); // Give up quietly.
-      }
-    }, 100);
+      })
+      .catch(function () {
+        callback(); // Let the caller continue even if frame loading failed.
+      });
   }
 
   // ---- local export ------------------------------------------------------
@@ -555,11 +713,20 @@
       '  border: 1px solid rgba(0,0,0,0.3); background: rgba(255,255,255,0.95);' +
       '  color: #222; cursor: pointer;' +
       '}' +
-      '.cc-bridge-toolbar-btn:hover { background: #fff; }';
+      '.cc-bridge-toolbar-btn:hover { background: #fff; }' +
+      '.cc-bridge-toolbar-status {' +
+      '  font-size: 12px; padding: 6px 4px; color: #fff; background: rgba(0,0,0,0.6);' +
+      '  border-radius: 4px; align-self: center;' +
+      '}' +
+      '.cc-bridge-toolbar-status:empty { display: none; }';
     document.documentElement.appendChild(toolbarStyle);
 
     const toolbar = document.createElement('div');
     toolbar.className = 'cc-bridge-toolbar';
+
+    const statusEl = document.createElement('span');
+    statusEl.className = 'cc-bridge-toolbar-status';
+    toolbar.appendChild(statusEl);
 
     const exportBtn = document.createElement('button');
     exportBtn.type = 'button';
@@ -580,6 +747,15 @@
     }
 
     document.body.appendChild(toolbar);
+  }
+
+  function setToolbarStatus(text) {
+    // The base-frame/bleed-margin pipeline can genuinely take tens of
+    // seconds (Card Conjurer's own frame compositing runs on the single JS
+    // main thread — confirmed against the live site). Surface that as
+    // in-progress rather than letting it look stalled.
+    const statusEl = document.querySelector('.cc-bridge-toolbar-status');
+    if (statusEl) statusEl.textContent = text;
   }
 
   // ---- activation gate --------------------------------------------------
