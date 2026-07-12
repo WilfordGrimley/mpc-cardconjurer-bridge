@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.7.0
+// @version      0.8.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -76,6 +76,21 @@
     GM_setValue('ccOrigin', origin);
   }
 
+  // Google Drive export is opt-in and per-user: each installation brings
+  // its own Google Cloud OAuth client (same "user supplies their own"
+  // pattern as the CC origin above), since this tool stays independent of
+  // any specific service — there's no shared cc-bridge Google app. See the
+  // "Connect Google Drive" menu command below for the one-time setup this
+  // requires (an Authorized JavaScript origin matching the CC origin, on
+  // the user's own OAuth client).
+  function getDriveClientId() {
+    return GM_getValue('driveClientId', '');
+  }
+
+  function setDriveClientId(clientId) {
+    GM_setValue('driveClientId', clientId);
+  }
+
   function getEnabledOrigins() {
     return GM_getValue('enabledOrigins', []);
   }
@@ -130,6 +145,20 @@
     toggleCurrentOrigin
   );
 
+  GM_registerMenuCommand('Configure Google Drive Client ID (for Drive export)', function () {
+    const current = getDriveClientId();
+    const input = prompt(
+      'Google OAuth Client ID for Drive export (from your own Google Cloud project — ' +
+        'Data Access → add the drive.file scope, then create an OAuth Client ID and add "' +
+        getCCOrigin() +
+        '" as an Authorized JavaScript origin):',
+      current
+    );
+    if (input === null) return;
+    setDriveClientId(input.trim());
+    alert('cc-bridge: Google Drive Client ID ' + (input.trim() ? 'saved.' : 'cleared.'));
+  });
+
   // ---- Card Conjurer receiver -------------------------------------------
   //
   // Card Conjurer's own deployed code has no listener for the message this
@@ -163,6 +192,12 @@
   // forever in that path, throwing on every reference. (Caught exactly this
   // way against the live site during testing.)
   let currentCardData = null;
+
+  // Same top-of-scope-before-the-early-return placement as currentCardData
+  // above, for the same reason — these are only ever touched from the
+  // receiver's own code paths, all of which live after that return.
+  let driveAccessToken = null;
+  let driveTokenClient = null;
 
   if (location.origin === getCCOrigin()) {
     // Only reskin when actually embedded via our own modal — a user who
@@ -935,6 +970,120 @@
     }
   }
 
+  // ---- Google Drive export ------------------------------------------
+  //
+  // Opt-in only: nothing here runs, and no script from accounts.google.com
+  // or googleapis.com is loaded, until the user clicks "Export to Drive"
+  // themselves. See CLAUDE.md's network-calls boundary — this is the exact
+  // exception carved out for it. Uses Google Identity Services' token
+  // client (a popup-based flow returning an access token directly to this
+  // page's JS), not a server-side redirect flow — there's no backend here
+  // to receive a redirect, so this is the flow that actually fits a
+  // userscript. The access token lives only in the `driveAccessToken`
+  // variable above (memory only, cleared on page reload) — never written
+  // to GM_setValue/localStorage, since it's a live credential, not
+  // configuration.
+
+  function ensureGisLoaded(callback) {
+    if (pageWindow.google && pageWindow.google.accounts && pageWindow.google.accounts.oauth2) {
+      callback();
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = 'https://accounts.google.com/gsi/client';
+    script.onload = callback;
+    script.onerror = function () {
+      setToolbarStatus('Failed to load Google Sign-In — check your connection.');
+    };
+    document.head.appendChild(script);
+  }
+
+  function connectGoogleDrive(onConnected) {
+    const clientId = getDriveClientId();
+    if (!clientId) {
+      alert(
+        'cc-bridge: set a Google Drive Client ID first — Tampermonkey menu → ' +
+          '"Configure Google Drive Client ID (for Drive export)".'
+      );
+      return;
+    }
+    setToolbarStatus('Connecting to Google Drive…');
+    ensureGisLoaded(function () {
+      if (!driveTokenClient) {
+        driveTokenClient = pageWindow.google.accounts.oauth2.initTokenClient({
+          client_id: clientId,
+          scope: 'https://www.googleapis.com/auth/drive.file',
+          callback: function (response) {
+            if (response && response.access_token) {
+              driveAccessToken = response.access_token;
+              setToolbarStatus('Connected to Google Drive.');
+              if (onConnected) onConnected();
+            } else {
+              setToolbarStatus('Google Drive connection failed or was cancelled.');
+            }
+          },
+        });
+      }
+      driveTokenClient.requestAccessToken();
+    });
+  }
+
+  function uploadCardToGoogleDrive(cardData) {
+    const canvas = pageWindow.cardCanvas;
+    if (!canvas) {
+      alert('cc-bridge: no card canvas found — is a card loaded?');
+      return;
+    }
+    if (!driveAccessToken) {
+      connectGoogleDrive(function () {
+        uploadCardToGoogleDrive(cardData);
+      });
+      return;
+    }
+
+    setToolbarStatus('Uploading to Google Drive…');
+    canvas.toBlob(function (blob) {
+      const metadata = {
+        name: buildExportFilename(cardData),
+        // Drive's own structured tagging (queryable via the Drive API's
+        // `properties has {...}` search, not just a filename convention) —
+        // this is the "correctly tagged with set code and things from
+        // import" part.
+        properties: {
+          cc_bridge_card_name: cardData.name || '',
+          cc_bridge_set_code: cardData.set_code || '',
+          cc_bridge_collector_number: cardData.collector_number || '',
+        },
+      };
+      const form = new FormData();
+      form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+      form.append('file', blob);
+
+      fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + driveAccessToken },
+        body: form,
+      })
+        .then(function (res) {
+          if (res.status === 401) {
+            // Token expired/revoked — clear it and let the next click
+            // reconnect rather than repeatedly failing silently.
+            driveAccessToken = null;
+            throw new Error('Google Drive session expired — click "Export to Drive" again to reconnect.');
+          }
+          if (!res.ok) throw new Error('upload failed (HTTP ' + res.status + ')');
+          return res.json();
+        })
+        .then(function () {
+          setToolbarStatus('Uploaded to Google Drive.');
+        })
+        .catch(function (e) {
+          setToolbarStatus('');
+          alert('cc-bridge: Google Drive upload failed — ' + e.message);
+        });
+    }, 'image/png');
+  }
+
   // ---- export toolbar (injected into the Card Conjurer page itself) -----
 
   function ensureExportToolbar(cardData) {
@@ -984,6 +1133,19 @@
       folderBtn.addEventListener('click', pickExportDirectory);
       toolbar.appendChild(folderBtn);
     }
+
+    // Always offered, regardless of browser — the Drive upload only needs
+    // fetch()/FormData, not the Chromium-only File System Access API.
+    // Nothing here runs until this button is actually clicked (see the
+    // Google Drive export section above).
+    const driveBtn = document.createElement('button');
+    driveBtn.type = 'button';
+    driveBtn.className = 'cc-bridge-toolbar-btn';
+    driveBtn.textContent = 'Export to Drive';
+    driveBtn.addEventListener('click', function () {
+      uploadCardToGoogleDrive(currentCardData);
+    });
+    toolbar.appendChild(driveBtn);
 
     document.body.appendChild(toolbar);
   }
