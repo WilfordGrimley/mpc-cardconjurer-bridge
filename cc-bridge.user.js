@@ -2113,25 +2113,52 @@
 
   // ---- button injection ----------------------------------------------
 
+  // Moves an already-injected button from its current anchor onto the
+  // art's own box (img.card-img's parent), if it isn't there already.
+  // Needed because injectButtonIfNeeded can run before the art has
+  // rendered (MPC Autofill's card images are `loading="lazy"`), in which
+  // case it falls back to rootEl — this is what upgrades that button once
+  // the art actually shows up on a later rescan, instead of leaving it
+  // stuck on rootEl forever (rootEl only ever gets scanned once, gated by
+  // INJECTED_MARKER_ATTR).
+  function upgradeButtonAnchor(rootEl) {
+    const artImg = rootEl.querySelector('img.card-img');
+    if (!artImg || !artImg.parentElement) return;
+    const anchorEl = artImg.parentElement;
+    if (anchorEl.classList.contains(BUTTON_ANCHOR_CLASS)) return; // already there
+
+    // The button is a direct child of whichever element it's currently
+    // anchored to (rootEl, in the not-yet-upgraded case) — find it there.
+    const btn = rootEl.querySelector(':scope > .' + BUTTON_CLASS);
+    if (!btn) return;
+
+    if (getComputedStyle(anchorEl).position === 'static') {
+      anchorEl.style.position = 'relative';
+    }
+    anchorEl.classList.add(BUTTON_ANCHOR_CLASS);
+    anchorEl.appendChild(btn);
+  }
+
   function injectButtonIfNeeded(rootEl) {
-    if (rootEl.hasAttribute(INJECTED_MARKER_ATTR)) return;
+    if (rootEl.hasAttribute(INJECTED_MARKER_ATTR)) {
+      upgradeButtonAnchor(rootEl);
+      return;
+    }
     if (!extractCardData(rootEl)) return;
 
-    // Anchor to rootEl (the card tile) by default — that's what's actually
-    // sized to the card on a normal grid. The one exception: MPC
-    // Autofill's card-details modal also matches CARD_ROOT_SELECTOR, but
-    // *is* the entire viewport-covering modal (position: fixed), not a
-    // card-sized tile — anchoring there pins the button to a corner of the
-    // browser viewport instead of the card. Anchor to the art's own box
-    // (img.card-img's parent) only in that one case; it's not used as the
-    // default because that box isn't always flush with the rendered art
-    // (can be letterboxed/wider than the actual image), which would push
-    // the button off the card on the grid.
-    let anchorEl = rootEl;
-    if (getComputedStyle(rootEl).position === 'fixed') {
-      const artImg = rootEl.querySelector('img.card-img');
-      if (artImg && artImg.parentElement) anchorEl = artImg.parentElement;
-    }
+    // Anchor to the art's own box (img.card-img's parent), not rootEl —
+    // rootEl is whatever CARD_ROOT_SELECTOR matched, which on a grid tile
+    // is the *whole* tile (header + art + name footer) and on MPC
+    // Autofill's card-details modal is the entire viewport-covering modal.
+    // The art's box (`.ratio-7x5` in the upstream/fork source) is sized to
+    // the real card's own proportions (`padding-bottom: 139.6825%`, i.e.
+    // 88mm/63mm) with `overflow: hidden`, so it — not the raw <img>, which
+    // is deliberately scaled ~9% past it to preview bleed and then
+    // clipped — is exactly the card's visible boundary. Falls back to
+    // rootEl if the art hasn't rendered yet (`loading="lazy"`); see
+    // upgradeButtonAnchor above for how that gets corrected once it has.
+    const artImg = rootEl.querySelector('img.card-img');
+    const anchorEl = (artImg && artImg.parentElement) || rootEl;
 
     const computedPosition = getComputedStyle(anchorEl).position;
     if (computedPosition === 'static') {
