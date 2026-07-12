@@ -1592,6 +1592,14 @@
     // element rather than scaling the button or anchorEl directly).
     '.' + BUTTON_TETHER_CLASS + ' {' +
     '  position: absolute; inset: 0; pointer-events: none;' +
+    // the site's the art element sets the art <img> itself to explicit
+    // z-index: 1 — a sibling at the default z-index: auto (no z-index
+    // set) always paints *behind* an explicit-z-index sibling regardless
+    // of DOM order, so without this the wrapper (and the trigger inside
+    // it) silently rendered behind the art: invisible and unclickable
+    // even though genuinely present in the DOM. Matches .cc-bridge-btn's
+    // own z-index for consistency.
+    '  z-index: 10;' +
     // Timing matches the hover-zoom wrapper's own img transition exactly, so
     // the two move in lockstep during the hover-zoom.
     '  transition: transform 0.15s ease-out;' +
