@@ -627,13 +627,9 @@
 
     const data = { name: name };
 
-    // data-card-set-code / data-card-collector-number: not part of the DOM
-    // API ProxyPrints actually shipped (data-card-name, data-card-identifier,
-    // data-source-key, data-card-dpi, data-card-type) — requested as a
-    // follow-up addition, matching dom-api.md's own documented forward-compat
-    // plan ("the card's resolved printing set/collector number"). Named here
-    // to match the postMessage payload shape directly; harmless no-op until
-    // that lands.
+    // data-card-set-code / data-card-collector-number: added in ProxyPrints
+    // commit 98561698, sourced from CardDocument.canonicalCard — omitted
+    // (not emitted empty) when a card's resolved printing isn't known.
     const setCode = rootEl.getAttribute('data-card-set-code');
     if (setCode) data.set_code = setCode;
 
@@ -657,13 +653,11 @@
     return el ? el.getAttribute(attr) || '' : '';
   }
 
-  // mpc:card-selected is real now (ProxyPrints commit 91681e77), firing with
-  // a camelCase detail: {name, identifier, sourceKey, dpi, cardType}. Only
-  // name overlaps today's payload fields; set_code/collector_number aren't
-  // in the event yet either (requested as a follow-up, matching dom-api.md's
-  // own forward-compat plan), mapped explicitly here — not a blind
-  // Object.assign — so this is correct as soon as they land instead of
-  // silently merging camelCase keys the payload builder never reads.
+  // mpc:card-selected is real now (ProxyPrints commits 91681e77, 98561698),
+  // firing with a camelCase detail: {name, identifier, sourceKey, dpi,
+  // cardType, setCode, collectorNumber}. Mapped explicitly below — not a
+  // blind Object.assign — since the event's camelCase keys don't match the
+  // payload's snake_case ones.
   let lastCardSelectedDetail = null;
   document.addEventListener('mpc:card-selected', function (event) {
     lastCardSelectedDetail = event && event.detail ? event.detail : null;
