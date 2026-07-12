@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.8.1
+// @version      0.9.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -76,13 +76,12 @@
     GM_setValue('ccOrigin', origin);
   }
 
-  // Google Drive export is opt-in and per-user: each installation brings
-  // its own Google Cloud OAuth client (same "user supplies their own"
-  // pattern as the CC origin above), since this tool stays independent of
-  // any specific service — there's no shared cc-bridge Google app. See the
-  // "Connect Google Drive" menu command below for the one-time setup this
-  // requires (an Authorized JavaScript origin matching the CC origin, on
-  // the user's own OAuth client).
+  // Google Drive export is opt-in. The OAuth connect + upload runs on the
+  // sender/mpchost page (proxyprints.ca etc.), not inside the Card
+  // Conjurer iframe — see the "Google Drive export" section far below for
+  // why. That means the Client ID's "Authorized JavaScript origins" needs
+  // the *host site's* origin (e.g. https://proxyprints.ca), not the CC
+  // origin.
   function getDriveClientId() {
     return GM_getValue('driveClientId', '');
   }
@@ -148,10 +147,10 @@
   GM_registerMenuCommand('Configure Google Drive Client ID (for Drive export)', function () {
     const current = getDriveClientId();
     const input = prompt(
-      'Google OAuth Client ID for Drive export (from your own Google Cloud project — ' +
-        'Data Access → add the drive.file scope, then create an OAuth Client ID and add "' +
-        getCCOrigin() +
-        '" as an Authorized JavaScript origin):',
+      'Google OAuth Client ID for Drive export — Data Access → add the drive.file scope, ' +
+        'then create an OAuth Client ID and add the origin of the site you conjure cards from ' +
+        '(e.g. https://proxyprints.ca — NOT the Card Conjurer origin) as an Authorized ' +
+        'JavaScript origin:',
       current
     );
     if (input === null) return;
@@ -193,11 +192,15 @@
   // way against the live site during testing.)
   let currentCardData = null;
 
-  // Same top-of-scope-before-the-early-return placement as currentCardData
-  // above, for the same reason — these are only ever touched from the
-  // receiver's own code paths, all of which live after that return.
-  let driveAccessToken = null;
-  let driveTokenClient = null;
+  // The origin of the page that framed us — captured from the import
+  // message's own event.origin (below), not from window.parent.location
+  // (cross-origin, unreadable). Needed to hand the finished export back to
+  // that page for Google Drive upload (see "Google Drive export" further
+  // down) — the OAuth Client ID's "Authorized JavaScript origins" only
+  // needs to list stable mpchost origins this way, not every possible
+  // self-hosted CC origin. Same top-of-scope-before-the-early-return
+  // placement as currentCardData above, for the same TDZ reason.
+  let senderOrigin = null;
 
   if (location.origin === getCCOrigin()) {
     // Only reskin when actually embedded via our own modal — a user who
@@ -250,7 +253,22 @@
       // against, so fall through to the payload-shape check alone.)
       if (window.parent !== window && event.source !== window.parent) return;
       const data = event.data;
+
+      // Reply to our own Google Drive export request (see
+      // sendCardToDriveViaParent below) — the sender page did the actual
+      // upload and is reporting how it went.
+      if (data && data.type === 'cc-bridge-drive-export-result') {
+        if (data.ok) {
+          setDriveToolbarStatus('Uploaded to Google Drive.');
+        } else {
+          setDriveToolbarStatus('');
+          alert('cc-bridge: Google Drive upload failed — ' + (data.message || 'unknown error'));
+        }
+        return;
+      }
+
       if (!data || typeof data.name !== 'string' || !data.name) return;
+      senderOrigin = event.origin; // Real origin from the message itself, not a cross-origin read.
       const key = JSON.stringify(data);
       if (key === lastHandledPayload) return;
       lastHandledPayload = key;
@@ -970,131 +988,33 @@
     }
   }
 
-  // ---- Google Drive export ------------------------------------------
+  // ---- Google Drive export (hand-off half) -------------------------------
   //
-  // Opt-in only: nothing here runs, and no script from accounts.google.com
-  // or googleapis.com is loaded, until the user clicks "Export to Drive"
-  // themselves. See CLAUDE.md's network-calls boundary — this is the exact
-  // exception carved out for it. Uses Google Identity Services' token
-  // client (a popup-based flow returning an access token directly to this
-  // page's JS), not a server-side redirect flow — there's no backend here
-  // to receive a redirect, so this is the flow that actually fits a
-  // userscript. The access token lives only in the `driveAccessToken`
-  // variable above (memory only, cleared on page reload) — never written
-  // to GM_setValue/localStorage, since it's a live credential, not
-  // configuration.
-
-  function ensureGisLoaded(callback) {
-    if (pageWindow.google && pageWindow.google.accounts && pageWindow.google.accounts.oauth2) {
-      callback();
-      return;
-    }
-    const script = document.createElement('script');
-    script.src = 'https://accounts.google.com/gsi/client';
-    script.onload = callback;
-    script.onerror = function () {
-      setToolbarStatus('Failed to load Google Sign-In — check your connection.');
-    };
-    document.head.appendChild(script);
-  }
-
-  function connectGoogleDrive(onConnected) {
-    const clientId = getDriveClientId();
-    if (!clientId) {
-      alert(
-        'cc-bridge: set a Google Drive Client ID first — Tampermonkey menu → ' +
-          '"Configure Google Drive Client ID (for Drive export)".'
-      );
-      return;
-    }
-    setToolbarStatus('Connecting to Google Drive…');
-    ensureGisLoaded(function () {
-      if (!driveTokenClient) {
-        driveTokenClient = pageWindow.google.accounts.oauth2.initTokenClient({
-          client_id: clientId,
-          scope: 'https://www.googleapis.com/auth/drive.file',
-          callback: function (response) {
-            if (response && response.access_token) {
-              driveAccessToken = response.access_token;
-              setToolbarStatus('Connected to Google Drive.');
-              if (onConnected) onConnected();
-            } else {
-              setToolbarStatus('Google Drive connection failed or was cancelled.');
-            }
-          },
-          // Without this, a genuine failure (popup blocked, network error
-          // during the OAuth handshake) has nowhere to go — only the
-          // success/cancel path above was reachable. ProxyPrints' own
-          // equivalent (googleDriveAuth.ts, commit 1c4d2c0e) wires this
-          // explicitly; adopted the same fix here.
-          error_callback: function (error) {
-            setToolbarStatus('');
-            const message = error && error.message ? error.message : String(error);
-            alert('cc-bridge: Google Drive connection failed — ' + message);
-          },
-        });
-      }
-      driveTokenClient.requestAccessToken();
-    });
-  }
-
-  function uploadCardToGoogleDrive(cardData) {
+  // The actual OAuth + upload happens on the sender/mpchost page (e.g.
+  // proxyprints.ca) — see its "Google Drive export" section further down —
+  // not here. A Client ID's "Authorized JavaScript origins" list requires
+  // exact domain matches, and the mpchost's own origin is a small, stable,
+  // known set under this project's control; the CC origin is
+  // user-configurable and could be any self-hosted domain, which doesn't
+  // work as an OAuth origin for installs meant to work for other users
+  // without each of them registering their own Client ID. This just
+  // renders the export and hands the blob to the sender via postMessage —
+  // still entirely triggered by this one user click, which is what
+  // CLAUDE.md's network-calls exception actually requires; the network
+  // call itself just happens one hop over.
+  function sendCardToDriveViaParent(cardData) {
     const canvas = pageWindow.cardCanvas;
     if (!canvas) {
       alert('cc-bridge: no card canvas found — is a card loaded?');
       return;
     }
-    if (!driveAccessToken) {
-      connectGoogleDrive(function () {
-        uploadCardToGoogleDrive(cardData);
-      });
+    if (!senderOrigin) {
+      alert('cc-bridge: no host page on record to hand this off to — reopen this from the "+ conjure" button.');
       return;
     }
-
-    setToolbarStatus('Uploading to Google Drive…');
+    setDriveToolbarStatus('Sending to host page for Drive upload…');
     canvas.toBlob(function (blob) {
-      const metadata = {
-        name: buildExportFilename(cardData),
-        // Drive's own structured tagging (queryable via the Drive API's
-        // `properties has {...}` search, not just a filename convention) —
-        // this is the "correctly tagged with set code and things from
-        // import" part.
-        properties: {
-          cc_bridge_card_name: cardData.name || '',
-          cc_bridge_set_code: cardData.set_code || '',
-          cc_bridge_collector_number: cardData.collector_number || '',
-        },
-      };
-      const form = new FormData();
-      form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
-      form.append('file', blob);
-
-      // &fields=id trims Google's response to just the file id instead of
-      // the full file resource — small, free saving, matching the same
-      // call in ProxyPrints' uploadFile (GoogleDriveService.ts, commit
-      // 1c4d2c0e).
-      fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', {
-        method: 'POST',
-        headers: { Authorization: 'Bearer ' + driveAccessToken },
-        body: form,
-      })
-        .then(function (res) {
-          if (res.status === 401) {
-            // Token expired/revoked — clear it and let the next click
-            // reconnect rather than repeatedly failing silently.
-            driveAccessToken = null;
-            throw new Error('Google Drive session expired — click "Export to Drive" again to reconnect.');
-          }
-          if (!res.ok) throw new Error('upload failed (HTTP ' + res.status + ')');
-          return res.json();
-        })
-        .then(function () {
-          setToolbarStatus('Uploaded to Google Drive.');
-        })
-        .catch(function (e) {
-          setToolbarStatus('');
-          alert('cc-bridge: Google Drive upload failed — ' + e.message);
-        });
+      window.parent.postMessage({ type: 'cc-bridge-drive-export', cardData: cardData, blob: blob }, senderOrigin);
     }, 'image/png');
   }
 
@@ -1116,11 +1036,11 @@
       '  color: #ebebeb; cursor: pointer;' +
       '}' +
       '.cc-bridge-toolbar-btn:hover { background: #3d8cd9; }' +
-      '.cc-bridge-toolbar-status {' +
+      '.cc-bridge-toolbar-status, .cc-bridge-toolbar-drive-status {' +
       '  font-size: 12px; padding: 6px 4px; color: #ebebeb; background: rgba(15,37,55,0.8);' +
       '  border-radius: 2px; align-self: center;' +
       '}' +
-      '.cc-bridge-toolbar-status:empty { display: none; }';
+      '.cc-bridge-toolbar-status:empty, .cc-bridge-toolbar-drive-status:empty { display: none; }';
     document.documentElement.appendChild(toolbarStyle);
 
     const toolbar = document.createElement('div');
@@ -1129,6 +1049,17 @@
     const statusEl = document.createElement('span');
     statusEl.className = 'cc-bridge-toolbar-status';
     toolbar.appendChild(statusEl);
+
+    // Separate from the frame-build/bleed-margin status above — that
+    // pipeline can still be updating its own status well after a Drive
+    // upload (a much faster round trip) has already finished, and the two
+    // sharing one text field meant whichever happened to fire last won,
+    // sometimes clobbering "Uploaded to Google Drive." with a stale
+    // "Applying bleed margin…" (confirmed happening in testing — a real
+    // race, not hypothetical).
+    const driveStatusEl = document.createElement('span');
+    driveStatusEl.className = 'cc-bridge-toolbar-drive-status';
+    toolbar.appendChild(driveStatusEl);
 
     const exportBtn = document.createElement('button');
     exportBtn.type = 'button';
@@ -1157,7 +1088,7 @@
     driveBtn.className = 'cc-bridge-toolbar-btn';
     driveBtn.textContent = 'Export to Drive';
     driveBtn.addEventListener('click', function () {
-      uploadCardToGoogleDrive(currentCardData);
+      sendCardToDriveViaParent(currentCardData);
     });
     toolbar.appendChild(driveBtn);
 
@@ -1170,6 +1101,11 @@
     // main thread — confirmed against the live site). Surface that as
     // in-progress rather than letting it look stalled.
     const statusEl = document.querySelector('.cc-bridge-toolbar-status');
+    if (statusEl) statusEl.textContent = text;
+  }
+
+  function setDriveToolbarStatus(text) {
+    const statusEl = document.querySelector('.cc-bridge-toolbar-drive-status');
     if (statusEl) statusEl.textContent = text;
   }
 
@@ -1308,6 +1244,172 @@
     const roots = document.querySelectorAll(CARD_ROOT_SELECTOR);
     for (let i = 0; i < roots.length; i++) {
       injectButtonIfNeeded(roots[i]);
+    }
+  }
+
+  // ---- Google Drive export (upload half, runs on this host page) --------
+  //
+  // The Card Conjurer iframe hands us a finished export via postMessage
+  // (sendCardToDriveViaParent, in the receiver section above) instead of
+  // uploading itself — see that section's comment for why. Opt-in only:
+  // nothing here runs, and no script from accounts.google.com or
+  // googleapis.com is loaded, until the export message actually arrives
+  // (which itself only happens because the user clicked "Export to Drive"
+  // inside the CC panel). See CLAUDE.md's network-calls boundary — this is
+  // the exact exception carved out for it. Uses Google Identity Services'
+  // token client (a popup-based flow returning an access token directly to
+  // this page's JS), not a server-side redirect flow — there's no backend
+  // here to receive one. The access token lives only in `driveAccessToken`
+  // below (memory only, cleared on page reload) — never written to
+  // GM_setValue/localStorage, since it's a live credential, not
+  // configuration.
+
+  let driveAccessToken = null;
+  let driveTokenClient = null;
+
+  function ensureGisLoaded(callback) {
+    if (pageWindow.google && pageWindow.google.accounts && pageWindow.google.accounts.oauth2) {
+      callback();
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = 'https://accounts.google.com/gsi/client';
+    script.onload = callback;
+    script.onerror = function () {
+      showDriveToast('Failed to load Google Sign-In — check your connection.', true);
+    };
+    document.head.appendChild(script);
+  }
+
+  function connectGoogleDrive(onConnected) {
+    const clientId = getDriveClientId();
+    if (!clientId) {
+      alert(
+        'cc-bridge: set a Google Drive Client ID first — Tampermonkey menu → ' +
+          '"Configure Google Drive Client ID (for Drive export)".'
+      );
+      return;
+    }
+    showDriveToast('Connecting to Google Drive…');
+    ensureGisLoaded(function () {
+      if (!driveTokenClient) {
+        driveTokenClient = pageWindow.google.accounts.oauth2.initTokenClient({
+          client_id: clientId,
+          scope: 'https://www.googleapis.com/auth/drive.file',
+          callback: function (response) {
+            if (response && response.access_token) {
+              driveAccessToken = response.access_token;
+              showDriveToast('Connected to Google Drive.');
+              if (onConnected) onConnected();
+            } else {
+              showDriveToast('Google Drive connection failed or was cancelled.', true);
+            }
+          },
+          error_callback: function (error) {
+            const message = error && error.message ? error.message : String(error);
+            showDriveToast('Google Drive connection failed — ' + message, true);
+          },
+        });
+      }
+      driveTokenClient.requestAccessToken();
+    });
+  }
+
+  function uploadBlobToGoogleDrive(cardData, blob, onDone) {
+    showDriveToast('Uploading to Google Drive…');
+    const metadata = {
+      name: buildExportFilename(cardData || {}),
+      // Drive's own structured tagging (queryable via the Drive API's
+      // `properties has {...}` search, not just a filename convention) —
+      // the "correctly tagged with set code and things from import" part.
+      properties: {
+        cc_bridge_card_name: (cardData && cardData.name) || '',
+        cc_bridge_set_code: (cardData && cardData.set_code) || '',
+        cc_bridge_collector_number: (cardData && cardData.collector_number) || '',
+      },
+    };
+    const form = new FormData();
+    form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+    form.append('file', blob);
+
+    // &fields=id trims Google's response to just the file id instead of
+    // the full file resource — small, free saving, matching the same call
+    // in ProxyPrints' uploadFile (GoogleDriveService.ts, commit 1c4d2c0e).
+    fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + driveAccessToken },
+      body: form,
+    })
+      .then(function (res) {
+        if (res.status === 401) {
+          // Token expired/revoked — clear it so the next attempt
+          // reconnects rather than repeatedly failing silently.
+          driveAccessToken = null;
+          throw new Error('Google Drive session expired — try exporting again.');
+        }
+        if (!res.ok) throw new Error('upload failed (HTTP ' + res.status + ')');
+        return res.json();
+      })
+      .then(function () {
+        showDriveToast('Uploaded to Google Drive.');
+        onDone(true);
+      })
+      .catch(function (e) {
+        showDriveToast('Google Drive upload failed — ' + e.message, true);
+        onDone(false, e.message);
+      });
+  }
+
+  function handleDriveExportMessage(event) {
+    // Only ever accept this from the Card Conjurer origin we ourselves
+    // configured and framed — not "*", matching the same validation
+    // discipline as every other postMessage boundary in this file.
+    if (event.origin !== getCCOrigin()) return;
+    const data = event.data;
+    if (!data || data.type !== 'cc-bridge-drive-export' || !data.blob) return;
+
+    function reply(ok, message) {
+      if (event.source) {
+        event.source.postMessage({ type: 'cc-bridge-drive-export-result', ok: ok, message: message }, event.origin);
+      }
+    }
+
+    function doUpload() {
+      uploadBlobToGoogleDrive(data.cardData, data.blob, reply);
+    }
+
+    if (!driveAccessToken) {
+      connectGoogleDrive(doUpload);
+    } else {
+      doUpload();
+    }
+  }
+
+  window.addEventListener('message', handleDriveExportMessage);
+
+  function showDriveToast(message, isError) {
+    let toast = document.querySelector('.cc-bridge-drive-toast');
+    if (!toast) {
+      const style = document.createElement('style');
+      style.textContent =
+        '.cc-bridge-drive-toast {' +
+        '  position: fixed; bottom: 16px; right: 16px; z-index: 999999;' +
+        '  font-size: 13px; padding: 10px 14px; border-radius: 2px; color: #ebebeb;' +
+        '  max-width: 320px; box-shadow: 0 4px 16px rgba(0,0,0,0.4);' +
+        '}';
+      document.documentElement.appendChild(style);
+      toast = document.createElement('div');
+      toast.className = 'cc-bridge-drive-toast';
+      document.body.appendChild(toast);
+    }
+    toast.style.background = isError ? '#b3432f' : '#4c9be8';
+    toast.style.display = 'block';
+    toast.textContent = message;
+    clearTimeout(toast._hideTimer);
+    if (!isError) {
+      toast._hideTimer = setTimeout(function () {
+        toast.style.display = 'none';
+      }, 4000);
     }
   }
 
