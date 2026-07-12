@@ -1895,7 +1895,7 @@
         canvas.height = img.naturalHeight;
         canvas.getContext('2d').drawImage(img, 0, 0);
 
-        if (data.modelUrl) {
+        if (data.modelUrl || data.modelBytes) {
           return runCustomModel(canvas, data, scaleFactor).catch(function (err) {
             // Any failure in the custom-model path (bad shape, CORS,
             // network, wrong tensor layout, a blob: model URL the iframe
@@ -1952,8 +1952,15 @@
     const nativeScale = data.modelScale || 4;
     let onnxSession = null;
 
+    // data.modelBytes (an ArrayBuffer, for the bundled GM_getResourceURL
+    // model — see sendHandoff) takes precedence over data.modelUrl (a
+    // real http(s) URL the iframe fetches itself, for a user's own custom
+    // model) — InferenceSession.create() accepts either a byte array or a
+    // URL directly.
+    const modelSource = data.modelBytes ? new Uint8Array(data.modelBytes) : data.modelUrl;
+
     return ensureOrtLoaded()
-      .then(function () { return window.ort.InferenceSession.create(data.modelUrl); })
+      .then(function () { return window.ort.InferenceSession.create(modelSource); })
       .then(function (session) {
         onnxSession = session;
         return runTiledInference(canvas, onnxSession, tileSize, overlap, channelOrder, nativeScale);
@@ -2232,7 +2239,42 @@
         // through at all, so runCustomModel's ONNX path was unreachable
         // regardless of configuration.
         const modelUrl = resolveUpscaleModelUrl();
-        if (modelUrl) payload.modelUrl = modelUrl;
+        if (!modelUrl) {
+          iframe.contentWindow.postMessage(payload, enlargerOrigin);
+          return;
+        }
+        if (modelUrl.indexOf('blob:') === 0) {
+          // A GM_getResourceURL blob: URL (the bundled Ultramix model) is
+          // only fetchable from the Document that created it — confirmed
+          // empirically, the hidden Enlarger iframe's own fetch() of it
+          // throws "NetworkError when attempting to fetch resource" even
+          // though it's nominally same-origin. Fetch the bytes here,
+          // where the blob: URL *is* valid, and transfer them across as
+          // an ArrayBuffer instead — onnxruntime-web's
+          // InferenceSession.create() accepts a byte array directly, so
+          // the iframe never needs to fetch anything itself for this path.
+          fetch(modelUrl)
+            .then(function (r) { return r.arrayBuffer(); })
+            .then(function (buf) {
+              // Confirms real bytes actually arrived, not just that
+              // fetch() didn't throw — an empty/truncated buffer would
+              // otherwise pass through silently as a "no warning" false
+              // positive.
+              console.log('cc-bridge: bundled Ultramix model loaded,', buf.byteLength, 'bytes');
+              payload.modelBytes = buf;
+              iframe.contentWindow.postMessage(payload, enlargerOrigin, [buf]);
+            })
+            .catch(function () {
+              // Bundled model bytes unreachable for some reason — proceed
+              // without a model rather than blocking the handoff.
+              iframe.contentWindow.postMessage(payload, enlargerOrigin);
+            });
+          return;
+        }
+        // A real http(s) URL (the user's own custom model) — fetched
+        // directly by the iframe itself, same as any other cross-origin
+        // CORS-enabled request; no blob: cross-Document restriction here.
+        payload.modelUrl = modelUrl;
         iframe.contentWindow.postMessage(payload, enlargerOrigin);
       });
 
