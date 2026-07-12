@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.11.0
+// @version      0.12.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -76,6 +76,19 @@
   };
 
   // ---- config helpers -------------------------------------------------
+
+  // The full URL to the user's own self-hosted Enlarger page — same "user
+  // supplies their own instance" pattern as the CC origin below. Empty
+  // means the "use Scryfall art"/"upload my own image" choice still
+  // appears, but just opens Card Conjurer directly without an upscale
+  // pass (degrades gracefully rather than being a hard requirement).
+  function getEnlargerUrl() {
+    return GM_getValue('enlargerUrl', '');
+  }
+
+  function setEnlargerUrl(url) {
+    GM_setValue('enlargerUrl', url);
+  }
 
   function getCCOrigin() {
     return GM_getValue('ccOrigin', DEFAULT_CC_ORIGIN);
@@ -172,6 +185,35 @@
     alert('cc-bridge: Card Conjurer origin set to ' + parsed.origin);
   });
 
+  GM_registerMenuCommand('Configure Enlarger URL (art upscaling)', function () {
+    const current = getEnlargerUrl();
+    const input = prompt(
+      'Enlarger page URL (your own self-hosted instance — e.g. https://your-host/enlarger). Leave blank to skip ' +
+        'the upscale pass entirely and go straight to Card Conjurer:',
+      current
+    );
+    if (input === null) return;
+    const trimmed = input.trim();
+    if (!trimmed) {
+      setEnlargerUrl('');
+      alert('cc-bridge: Enlarger URL cleared — the art-source choice will open Card Conjurer directly.');
+      return;
+    }
+    let parsed;
+    try {
+      parsed = new URL(trimmed);
+    } catch (e) {
+      alert('cc-bridge: "' + trimmed + '" is not a valid URL. Origin not changed.');
+      return;
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      alert('cc-bridge: origin must be http:// or https://. Origin not changed.');
+      return;
+    }
+    setEnlargerUrl(trimmed);
+    alert('cc-bridge: Enlarger URL set to ' + trimmed);
+  });
+
   GM_registerMenuCommand(
     (isOriginEnabled(location.origin) ? 'Disable' : 'Enable') + ' conjuring on this site',
     toggleCurrentOrigin
@@ -263,6 +305,12 @@
   // placement as currentCardData above, for the same TDZ reason.
   let senderOrigin = null;
 
+  // The upscaled (or raw user-uploaded) art blob from the current import
+  // payload, if any — same TDZ-safe placement as the two above, since
+  // doFillCardConjurerImport (which consumes this) lives after the early
+  // return too.
+  let pendingCustomArtBlob = null;
+
   if (location.origin === getCCOrigin()) {
     // Only reskin when actually embedded via our own modal — a user who
     // separately has this script installed and visits Card Conjurer
@@ -330,6 +378,7 @@
 
       if (!data || typeof data.name !== 'string' || !data.name) return;
       senderOrigin = event.origin; // Real origin from the message itself, not a cross-origin read.
+      if (data.customArtBlob) pendingCustomArtBlob = data.customArtBlob;
       const key = JSON.stringify(data);
       if (key === lastHandledPayload) return;
       lastHandledPayload = key;
@@ -427,6 +476,7 @@
     const importIndex = document.querySelector('#import-index');
     if (!importIndex) {
       setTimeout(function () {
+        applyPendingCustomArt();
         refreshAutoFrame();
         setToolbarStatus('Applying bleed margin…');
         applyBleedMargin();
@@ -439,6 +489,13 @@
       if (wantsSpecificPrint) {
         selectMatchingPrint(importIndex, cardData);
       }
+      // #import-index only just finished populating, which is what
+      // triggers Card Conjurer's own Scryfall auto-art-fetch as a side
+      // effect of importChanged() — by the time this MutationObserver
+      // callback actually runs (always after the DOM mutation that
+      // triggered it), that auto-fetch has already happened, so applying
+      // a custom art override here reliably wins rather than racing it.
+      applyPendingCustomArt();
       setToolbarStatus('Building frame…');
       const scryfallCardData = getSelectedScryfallCard();
       loadBaseFrame(scryfallCardData, function () {
@@ -453,6 +510,39 @@
     setTimeout(function () {
       observer.disconnect();
     }, 8000);
+  }
+
+  // Applies pendingCustomArtBlob (the upscaled-or-raw art the user chose
+  // via the art-source popover) over whatever art Card Conjurer's own
+  // import just auto-fetched from Scryfall. Same mechanism Card
+  // Conjurer's own paste-art feature uses — confirmed by reading
+  // creator-23.js's pasteArt(): URL.createObjectURL(blob) followed by
+  // uploadArt(url, 'autoFit') — a blob: URL works as an <img> src exactly
+  // like a remote one, and 'autoFit' sizes/positions it the same way a
+  // real Scryfall art_crop would be.
+  function applyPendingCustomArt() {
+    if (!pendingCustomArtBlob || typeof pageWindow.uploadArt !== 'function') return;
+    const url = URL.createObjectURL(pendingCustomArtBlob);
+    pendingCustomArtBlob = null; // Consumed — don't reapply on a later re-import in the same session.
+    applyCustomArtRobust(url, 4);
+  }
+
+  // selectMatchingPrint (below) selects a *specific* printing and
+  // dispatches a change event on #import-index, which triggers Card
+  // Conjurer's own async art re-fetch for that exact printing — this can
+  // complete after our override above and silently win the race, undoing
+  // it back to Scryfall's own art. Confirmed happening in testing (the
+  // override visibly applied, then got clobbered moments later). Same
+  // verify-and-reapply pattern already used for the frame-option-
+  // selection race earlier in this file — re-asserting a few times over
+  // the next couple of seconds reliably wins regardless of exactly when
+  // Card Conjurer's own fetch finishes.
+  function applyCustomArtRobust(url, checksRemaining) {
+    pageWindow.uploadArt(url, 'autoFit');
+    if (checksRemaining <= 0) return;
+    setTimeout(function () {
+      applyCustomArtRobust(url, checksRemaining - 1);
+    }, 700);
   }
 
   function selectMatchingPrint(importIndex, cardData) {
@@ -1223,7 +1313,20 @@
     '  background: #4c9be8; color: #ebebeb; font-size: 18px; line-height: 1;' +
     '  cursor: pointer;' +
     '}' +
-    '.cc-bridge-modal-close:hover { background: #3d8cd9; }';
+    '.cc-bridge-modal-close:hover { background: #3d8cd9; }' +
+    '.cc-bridge-art-popover {' +
+    '  position: fixed; z-index: 1000000; width: 190px;' +
+    '  background: #0f2537; border: 1px solid #20374c; border-radius: 2px;' +
+    '  box-shadow: 0 6px 20px rgba(0,0,0,0.4); overflow: hidden;' +
+    '  display: flex; flex-direction: column;' +
+    '}' +
+    '.cc-bridge-art-popover-opt {' +
+    '  display: block; width: 100%; text-align: left;' +
+    '  background: transparent; border: none; border-bottom: 1px solid #20374c;' +
+    '  color: #ebebeb; font-size: 12px; padding: 9px 12px; cursor: pointer;' +
+    '}' +
+    '.cc-bridge-art-popover-opt:last-child { border-bottom: none; }' +
+    '.cc-bridge-art-popover-opt:hover { background: #4c9be8; color: #1c0d07; }';
   document.documentElement.appendChild(style);
 
   // ---- card data extraction ------------------------------------------
@@ -1262,6 +1365,92 @@
 
   function attrOf(el, attr) {
     return el ? el.getAttribute(attr) || '' : '';
+  }
+
+  // The card's own rendered art URL — read straight off the DOM (same
+  // img.card-img element extractCardData already knows about), not a new
+  // fetch of any kind. Whatever the host page is already displaying is
+  // what gets upscaled; no separate Scryfall API call from this script.
+  function extractCardArtUrl(rootEl) {
+    const img = rootEl.querySelector('img.card-img');
+    return img && img.src ? img.src : null;
+  }
+
+  // ---- Enlarger hand-off (upscale pass before Card Conjurer even opens) -
+  //
+  // Both art-source choices ("use Scryfall art" / "upload my own image")
+  // route through here first — the upscaled result becomes the
+  // customArtBlob in openEditorModal's initial payload, applied inside
+  // Card Conjurer after its own Scryfall auto-art-fetch settles (see
+  // doFillCardConjurerImport). If no Enlarger URL is configured, or
+  // anything about the hand-off fails, this calls back with null and the
+  // caller proceeds without an upscale pass — never a hard blocker to
+  // getting the card into Card Conjurer at all.
+  function upscaleViaEnlarger(source, callback) {
+    const enlargerUrl = getEnlargerUrl();
+    if (!enlargerUrl) {
+      callback(null);
+      return;
+    }
+    let enlargerOrigin;
+    try {
+      enlargerOrigin = new URL(enlargerUrl).origin;
+    } catch (e) {
+      callback(null);
+      return;
+    }
+
+    function sendHandoff(dataUrlOrUrl, isDataUrl) {
+      const iframe = document.createElement('iframe');
+      iframe.style.display = 'none';
+      let done = false;
+      let timeoutId = null;
+
+      function cleanup() {
+        window.removeEventListener('message', onMessage);
+        if (timeoutId) clearTimeout(timeoutId);
+        if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
+      }
+
+      function onMessage(event) {
+        if (event.origin !== enlargerOrigin) return;
+        const data = event.data;
+        if (!data || data.type !== 'enlarger-result') return;
+        done = true;
+        cleanup();
+        callback(data.blob || null);
+      }
+      window.addEventListener('message', onMessage);
+
+      iframe.addEventListener('load', function () {
+        const payload = { type: 'enlarger-load', scale: 2, autoSend: true };
+        if (isDataUrl) payload.dataUrl = dataUrlOrUrl;
+        else payload.url = dataUrlOrUrl;
+        iframe.contentWindow.postMessage(payload, enlargerOrigin);
+      });
+
+      // Never let a slow/broken Enlarger instance block getting the card
+      // into Card Conjurer at all — fall through to no-upscale instead.
+      timeoutId = setTimeout(function () {
+        if (done) return;
+        cleanup();
+        callback(null);
+      }, 20000);
+
+      iframe.src = enlargerUrl;
+      document.body.appendChild(iframe);
+    }
+
+    if (source.file) {
+      const reader = new FileReader();
+      reader.onload = function () { sendHandoff(reader.result, true); };
+      reader.onerror = function () { callback(null); };
+      reader.readAsDataURL(source.file);
+    } else if (source.url) {
+      sendHandoff(source.url, false);
+    } else {
+      callback(null);
+    }
   }
 
   // mpc:card-selected is real now (ProxyPrints commits 91681e77, 98561698),
@@ -1505,14 +1694,115 @@
       cardData = mergeCardSelectedDetail(cardData, lastCardSelectedDetail);
     }
 
-    openEditorModal(cardData, rootEl.getBoundingClientRect());
+    showArtSourcePopover(btn, cardData, rootEl, rootEl.getBoundingClientRect());
   });
+
+  // ---- art source choice (Scryfall vs. the user's own upload) -----------
+  //
+  // Card Conjurer's own import already fetches Scryfall's art
+  // automatically as part of loading the card by name — this doesn't skip
+  // that (it still drives frame selection, text fields, mana cost, etc.
+  // off the real Scryfall record), it just re-uploads over the art layer
+  // afterward when the user asked for their own image. Same mechanism
+  // Card Conjurer's own paste-art feature uses (confirmed by reading
+  // creator-23.js's pasteArt(): URL.createObjectURL(blob) -> uploadArt(url,
+  // 'autoFit')) — a blob: URL works as an <img> src exactly like a remote
+  // one.
+  let openArtSourcePopover = null; // Tracks the currently-open one so a second click replaces rather than stacks.
+
+  function closeArtSourcePopover() {
+    if (openArtSourcePopover && openArtSourcePopover.parentNode) {
+      openArtSourcePopover.parentNode.removeChild(openArtSourcePopover);
+    }
+    openArtSourcePopover = null;
+    document.removeEventListener('click', onOutsideClick, true);
+    document.removeEventListener('keydown', onPopoverKeydown);
+  }
+
+  function onOutsideClick(event) {
+    if (openArtSourcePopover && !openArtSourcePopover.contains(event.target)) closeArtSourcePopover();
+  }
+
+  function onPopoverKeydown(event) {
+    if (event.key === 'Escape') closeArtSourcePopover();
+  }
+
+  function showArtSourcePopover(anchorBtn, cardData, rootEl, originRect) {
+    closeArtSourcePopover();
+
+    const rect = anchorBtn.getBoundingClientRect();
+    const pop = document.createElement('div');
+    pop.className = 'cc-bridge-art-popover';
+    pop.style.top = rect.bottom + 4 + 'px';
+    pop.style.left = Math.max(4, rect.right - 190) + 'px';
+
+    const scryfallOpt = document.createElement('button');
+    scryfallOpt.type = 'button';
+    scryfallOpt.className = 'cc-bridge-art-popover-opt';
+    scryfallOpt.textContent = 'Use Scryfall art';
+    scryfallOpt.addEventListener('click', function () {
+      closeArtSourcePopover();
+      const artUrl = extractCardArtUrl(rootEl);
+      if (!artUrl || !getEnlargerUrl()) {
+        openEditorModal(cardData, originRect);
+        return;
+      }
+      showDriveToast('Upscaling art…');
+      upscaleViaEnlarger({ url: artUrl }, function (blob) {
+        showDriveToast(blob ? 'Upscaled — opening Card Conjurer.' : 'Upscale unavailable — using Scryfall art as-is.');
+        openEditorModal(cardData, originRect, blob);
+      });
+    });
+
+    const uploadOpt = document.createElement('button');
+    uploadOpt.type = 'button';
+    uploadOpt.className = 'cc-bridge-art-popover-opt';
+    uploadOpt.textContent = 'Upload my own image…';
+    uploadOpt.addEventListener('click', function () {
+      closeArtSourcePopover();
+      const fileInput = document.createElement('input');
+      fileInput.type = 'file';
+      fileInput.accept = 'image/*';
+      fileInput.style.display = 'none';
+      document.body.appendChild(fileInput);
+      fileInput.addEventListener('change', function () {
+        const file = fileInput.files[0];
+        fileInput.remove();
+        if (!file) return;
+        if (!getEnlargerUrl()) {
+          openEditorModal(cardData, originRect, file);
+          return;
+        }
+        showDriveToast('Upscaling your image…');
+        upscaleViaEnlarger({ file: file }, function (blob) {
+          // Fall back to the raw upload if the upscale pass didn't come
+          // through — the user's own explicit choice should never just
+          // get silently dropped because Enlarger was unreachable.
+          showDriveToast(blob ? 'Upscaled — opening Card Conjurer.' : 'Upscale unavailable — using your image as-is.');
+          openEditorModal(cardData, originRect, blob || file);
+        });
+      });
+      fileInput.click();
+    });
+
+    pop.appendChild(scryfallOpt);
+    pop.appendChild(uploadOpt);
+    document.body.appendChild(pop);
+    openArtSourcePopover = pop;
+
+    // setTimeout so this click itself (already bubbling to document.body's
+    // own listener above) doesn't immediately trigger onOutsideClick.
+    setTimeout(function () {
+      document.addEventListener('click', onOutsideClick, true);
+      document.addEventListener('keydown', onPopoverKeydown);
+    }, 0);
+  }
 
   // Only one editor modal at a time; tracks the previous instance's own
   // cleanup so a second "+ conjure" click replaces rather than stacks.
   let closeCurrentModal = null;
 
-  function openEditorModal(cardData, originRect) {
+  function openEditorModal(cardData, originRect, customArtBlob) {
     if (closeCurrentModal) closeCurrentModal();
 
     const ccOrigin = getCCOrigin();
@@ -1594,6 +1884,12 @@
     if (cardData.set_code) payload.set_code = cardData.set_code;
     if (cardData.collector_number) payload.collector_number = cardData.collector_number;
     if (cardData.frame_hint) payload.frame_hint = cardData.frame_hint;
+    // A Blob is structured-clone-transferable via postMessage same as the
+    // Drive export blob hand-off elsewhere in this file — no base64
+    // round-trip needed. Applied inside Card Conjurer after its own
+    // Scryfall auto-art-fetch settles (doFillCardConjurerImport), so this
+    // overrides it rather than racing it.
+    if (customArtBlob) payload.customArtBlob = customArtBlob;
 
     iframe.addEventListener('load', function () {
       let attempts = 0;
