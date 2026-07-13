@@ -176,6 +176,23 @@
     }
   }
 
+  // The final requested output scale for the Enlarger hand-off. Ultramix
+  // (like all ESRGAN/RRDBNet-family models) is fixed-scale — it can only
+  // run at its trained native resolution (4x) — so requesting anything
+  // less means running the model at 4x and then resizing that down,
+  // same approach tools like Upscayl use for a "2x" option against a
+  // native-4x model; there's no other way to get a sub-native-scale
+  // result out of a fixed-scale network. 2x by default (matches this
+  // project's own pre-Ultramix behavior); 4 uses the model's native
+  // output directly with no lossy downsample step at all.
+  function getUpscaleTargetScale() {
+    return GM_getValue('upscaleTargetScale', 2);
+  }
+
+  function setUpscaleTargetScale(scale) {
+    GM_setValue('upscaleTargetScale', scale);
+  }
+
   function getEnabledOrigins() {
     return GM_getValue('enabledOrigins', []);
   }
@@ -287,6 +304,27 @@
       );
     }
   );
+
+  GM_registerMenuCommand('Configure upscale output size (2x/4x)', function () {
+    const current = getUpscaleTargetScale();
+    const input = prompt(
+      'Final output scale for the Enlarger upscale pass. Ultramix (like all ESRGAN-family models) only ' +
+        'runs at its native 4x resolution — requesting 2 here still runs the model at full 4x, then resizes ' +
+        'that down to 2x (same approach tools like Upscayl use for a "2x" option against a native-4x model; ' +
+        'there\'s no other way to get a sub-native-scale result from a fixed-scale network). Enter 4 to skip ' +
+        'that downsample step entirely and keep the model\'s full native output (larger images, more visible ' +
+        'detail gain). Enter 2 for the smaller, original output size:',
+      current
+    );
+    if (input === null) return;
+    const parsed = parseInt(input.trim(), 10);
+    if (!parsed || parsed < 1 || parsed > 8) {
+      alert('cc-bridge: "' + input + '" isn\'t a valid scale (1-8). Not changed.');
+      return;
+    }
+    setUpscaleTargetScale(parsed);
+    alert('cc-bridge: upscale output scale set to ' + parsed + 'x.');
+  });
 
   // ---- Card Conjurer receiver -------------------------------------------
   //
@@ -2121,7 +2159,20 @@
         if (nativeScale !== scaleFactor) {
           const targetW = Math.round(canvas.width * scaleFactor);
           const targetH = Math.round(canvas.height * scaleFactor);
-          return upscaleImage(result, targetW, targetH, 0);
+          // Resizing a fixed-scale model's native output down to a smaller
+          // requested scale (e.g. this model's native 4x down to a
+          // requested 2x — there's no other way to get a sub-native-scale
+          // result out of a fixed-scale network, same approach tools like
+          // Upscayl use) is a real low-pass filtering step -- a plain
+          // resize with no compensating sharpen washes out a real chunk of
+          // the detail the model just synthesized, to the point of look-
+          // ing barely different from the classical fallback. Confirmed
+          // by live user report ("art looks unupscaled"). Only applies
+          // when actually downsampling; upsampling further past the
+          // model's native output (scaleFactor > nativeScale, unusual)
+          // stays unsharpened to avoid ringing on top of an enlarge.
+          const sharpenPct = nativeScale > scaleFactor ? 15 : 0;
+          return upscaleImage(result, targetW, targetH, sharpenPct);
         }
         return result;
       });
@@ -2433,7 +2484,7 @@
       window.addEventListener('message', onMessage);
 
       iframe.addEventListener('load', function () {
-        const payload = { type: 'enlarger-load', scale: 2 };
+        const payload = { type: 'enlarger-load', scale: getUpscaleTargetScale() };
         if (isDataUrl) payload.dataUrl = dataUrlOrUrl;
         else payload.url = dataUrlOrUrl;
         // Bundled Ultramix by default, the user's own configured model if
