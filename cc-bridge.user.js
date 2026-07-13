@@ -1552,7 +1552,7 @@
 
   // ---- reimport art mid-session (relays through the sender page) --------
   //
-  // The actual upscale (upscaleViaEnlarger, ENLARGER_HTML) only exists in
+  // The actual upscale (upscaleViaEnlarger, ENLARGER_WORKER_SCRIPT) only exists in
   // the sender/host page's own code path — this receiver code path
   // returned early long before that's ever defined, they're the same
   // script file but never the same running context. So this asks the
@@ -1903,19 +1903,20 @@
   }
 
   // The full Enlarger tool, embedded directly — no separate hosting at
-  // all. Runs entirely headless: no visible UI, so no fonts/CSS either
-  // (nothing to ever render on screen). Turned into a blob: URL at
-  // hand-off time (see upscaleViaEnlarger) rather than a data: URL —
-  // confirmed directly against a real page: a blob: iframe's own
-  // location.origin, and the origin the parent sees on messages back
-  // from it, both correctly report the *creating* page's real origin,
-  // not "null"/opaque the way a data: URL's would — so the existing
-  // exact-origin postMessage validation this project uses everywhere
-  // else still applies cleanly here, with no separate origin to
-  // configure at all.
-  const ENLARGER_HTML = `<title>Enlarger (background)</title>
-<script>
-(function () {
+  // all. Runs as a dedicated Worker, not a hidden iframe: tiled model
+  // inference is a genuinely long synchronous WASM computation per tile
+  // (confirmed live — a full card image froze the whole tab for minutes),
+  // and there's no threading available to onnxruntime-web itself (no
+  // cross-origin-isolation headers for SharedArrayBuffer) -- the only way
+  // to keep the tab responsive during that work is to run it on a
+  // genuinely separate thread. A Worker has no DOM, so this uses
+  // createImageBitmap/OffscreenCanvas instead of Image/<canvas> — a
+  // strict improvement, not a workaround: no hidden iframe element ever
+  // needs to touch the page's DOM at all now, and there's no more
+  // cross-Document postMessage origin dance for this channel either
+  // (dedicated Workers are a private channel to whoever constructed
+  // them, not a shared/broadcast one the way cross-frame postMessage is).
+  const ENLARGER_WORKER_SCRIPT = `
   'use strict';
 
   // onnxruntime-web's own internal WASM-backend init tries several CDN
@@ -1924,20 +1925,17 @@
   // (confirmed in the interactive build this was stripped down from) —
   // only about not letting a third-party library's internals surface as
   // a raw uncaught error in this tab.
-  window.addEventListener('unhandledrejection', function (event) {
+  self.addEventListener('unhandledrejection', function (event) {
     console.warn('Enlarger: suppressed an unhandled promise rejection (likely onnxruntime-web internals):', event.reason);
     event.preventDefault();
   });
 
-  // No visible UI at all — this only ever runs embedded as a hidden
-  // iframe cc-bridge creates from an inline blob: URL (see
-  // upscaleViaEnlarger in cc-bridge.user.js), so window.parent is always
-  // the real receiver and location.origin always matches it (blob: URLs
-  // inherit the creating document's origin for both, confirmed directly:
-  // a blob: iframe's location.origin and the postMessage event.origin the
-  // parent sees both report the parent's own real origin, not "null" or
-  // anything blob-specific).
-  window.addEventListener('message', function (event) {
+  // No DOM, no visible UI -- this only ever runs as a dedicated Worker
+  // cc-bridge spawns from an inline blob: URL (see upscaleViaEnlarger in
+  // cc-bridge.user.js). self.postMessage here talks directly back to
+  // whoever constructed this worker; no origin/target checking needed
+  // the way cross-frame postMessage requires.
+  self.addEventListener('message', function (event) {
     const data = event.data;
     if (!data || data.type !== 'enlarger-load') return;
     const cardData = data.cardData || null;
@@ -1945,22 +1943,19 @@
     const source = data.url || data.dataUrl;
     if (!source) return;
 
-    loadImage(source, !!data.url)
-      .then(function (img) {
-        const canvas = document.createElement('canvas');
-        canvas.width = img.naturalWidth;
-        canvas.height = img.naturalHeight;
-        canvas.getContext('2d').drawImage(img, 0, 0);
+    loadImage(source)
+      .then(function (bitmap) {
+        const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+        canvas.getContext('2d').drawImage(bitmap, 0, 0);
 
         if (data.modelUrl || data.modelBytes) {
           return runCustomModel(canvas, data, scaleFactor).catch(function (err) {
             // Any failure in the custom-model path (bad shape, CORS,
-            // network, wrong tensor layout, a blob: model URL the iframe
-            // couldn't fetch) falls back to the built-in resampler rather
-            // than producing nothing -- but do it loudly, since this is
-            // now the default path for every install and a silent
-            // degrade-to-Lanczos looks identical to a successful upscale
-            // from the output alone.
+            // network, wrong tensor layout) falls back to the built-in
+            // resampler rather than producing nothing -- but do it
+            // loudly, since this is now the default path for every
+            // install and a silent degrade-to-Lanczos looks identical to
+            // a successful upscale from the output alone.
             console.warn('Enlarger: model-based upscale failed, falling back to classical resize:', err);
             return runBuiltin(canvas, scaleFactor);
           });
@@ -1968,30 +1963,28 @@
         return runBuiltin(canvas, scaleFactor);
       })
       .then(function (resultCanvas) {
-        resultCanvas.toBlob(function (blob) {
-          window.parent.postMessage({ type: 'enlarger-result', blob: blob, cardData: cardData }, location.origin);
-        }, 'image/png');
+        return resultCanvas.convertToBlob({ type: 'image/png' }).then(function (blob) {
+          self.postMessage({ type: 'enlarger-result', blob: blob, cardData: cardData });
+        });
       })
       .catch(function (err) {
-        window.parent.postMessage(
-          { type: 'enlarger-result', blob: null, cardData: cardData, error: err.message },
-          location.origin
-        );
+        self.postMessage({ type: 'enlarger-result', blob: null, cardData: cardData, error: err.message });
       });
   });
 
-  function loadImage(src, useCors) {
-    return new Promise(function (resolve, reject) {
-      const img = new Image();
-      // Scryfall's image CDN serves permissive CORS; crossOrigin lets us
-      // actually read pixels back out of the canvas afterward instead of
-      // hitting a tainted-canvas security error. Not set for data: URLs
-      // (the "upload your own image" path), which don't need it.
-      if (useCors) img.crossOrigin = 'anonymous';
-      img.onload = function () { resolve(img); };
-      img.onerror = function () { reject(new Error('failed to load source image')); };
-      img.src = src;
-    });
+  function loadImage(src) {
+    // fetch() handles both data: URLs (the "upload my own image" path)
+    // and remote http(s) URLs (Scryfall's art CDN, which serves
+    // permissive CORS) uniformly -- no separate crossOrigin flag needed
+    // the way an <img> element required, since a Worker has no <img> at
+    // all. createImageBitmap decodes the fetched bytes directly, no
+    // canvas round-trip needed just to get pixels.
+    return fetch(src)
+      .then(function (res) {
+        if (!res.ok) throw new Error('failed to load source image: ' + res.status);
+        return res.blob();
+      })
+      .then(function (blob) { return createImageBitmap(blob); });
   }
 
   function runBuiltin(canvas, scaleFactor) {
@@ -2011,13 +2004,13 @@
 
     // data.modelBytes (an ArrayBuffer, for the bundled GM_getResourceURL
     // model — see sendHandoff) takes precedence over data.modelUrl (a
-    // real http(s) URL the iframe fetches itself, for a user's own custom
+    // real http(s) URL the worker fetches itself, for a user's own custom
     // model) — InferenceSession.create() accepts either a byte array or a
     // URL directly.
     const modelSource = data.modelBytes ? new Uint8Array(data.modelBytes) : data.modelUrl;
 
     return ensureOrtLoaded()
-      .then(function () { return window.ort.InferenceSession.create(modelSource); })
+      .then(function () { return self.ort.InferenceSession.create(modelSource); })
       .then(function (session) {
         onnxSession = session;
         return runTiledInference(canvas, onnxSession, tileSize, overlap, channelOrder, nativeScale);
@@ -2135,8 +2128,7 @@
     const pass2 = resampleAxis(pass1, targetW, canvas.height, targetW, targetH, false, a);
     const sharpened = unsharpMask(pass2, targetW, targetH, sharpenPct);
 
-    const out = document.createElement('canvas');
-    out.width = targetW; out.height = targetH;
+    const out = new OffscreenCanvas(targetW, targetH);
     const outCtx = out.getContext('2d');
     const imgData = outCtx.createImageData(targetW, targetH);
     for (let i = 0; i < sharpened.length; i++) {
@@ -2167,14 +2159,18 @@
   const ORT_CDN_URL = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/ort.min.js';
 
   function ensureOrtLoaded() {
-    if (window.ort) return Promise.resolve();
-    return new Promise(function (resolve, reject) {
-      const script = document.createElement('script');
-      script.src = ORT_CDN_URL;
-      script.onload = function () { resolve(); };
-      script.onerror = function () { reject(new Error('could not load onnxruntime-web')); };
-      document.head.appendChild(script);
-    });
+    if (self.ort) return Promise.resolve();
+    // importScripts is synchronous and worker-native -- no <script>/
+    // document.head to append to in here. onnxruntime-web's UMD build
+    // attaches itself to globalThis (== self, inside a worker) the same
+    // way it attaches to window in a page context, so self.ort works
+    // identically either way once loaded.
+    try {
+      importScripts(ORT_CDN_URL);
+      return Promise.resolve();
+    } catch (e) {
+      return Promise.reject(new Error('could not load onnxruntime-web'));
+    }
   }
 
   // Splits the source into overlapping tiles, runs each through the ONNX
@@ -2185,9 +2181,7 @@
   async function runTiledInference(canvas, onnxSession, tileSize, overlap, channelOrder, nativeScale) {
     const srcCtx = canvas.getContext('2d');
     const W = canvas.width, H = canvas.height;
-    const outCanvas = document.createElement('canvas');
-    outCanvas.width = W * nativeScale;
-    outCanvas.height = H * nativeScale;
+    const outCanvas = new OffscreenCanvas(W * nativeScale, H * nativeScale);
     const outCtx = outCanvas.getContext('2d');
 
     const stepX = tileSize - overlap * 2;
@@ -2214,19 +2208,20 @@
 
         const destX = sx * nativeScale;
         const destY = sy * nativeScale;
-        const tmp = document.createElement('canvas');
-        tmp.width = outTile.width; tmp.height = outTile.height;
+        const tmp = new OffscreenCanvas(outTile.width, outTile.height);
         tmp.getContext('2d').putImageData(outTile, 0, 0);
         outCtx.drawImage(tmp, destX, destY);
 
         // A full card image can be 60-100+ tiles, each a real RRDBNet
-        // forward pass — easily minutes of work. The parent's hand-off
-        // timeout (see upscaleViaEnlarger/scheduleTimeout in
-        // cc-bridge.user.js) resets on each of these pings rather than
-        // using one fixed deadline, so real in-progress work here doesn't
-        // get killed partway through.
+        // forward pass — easily minutes of work, but it's off the main
+        // thread now (this whole file runs as a dedicated Worker), so it
+        // no longer freezes the tab while it happens. The parent's
+        // hand-off timeout (see upscaleViaEnlarger/scheduleTimeout in
+        // cc-bridge.user.js) still resets on each of these pings rather
+        // than using one fixed deadline, so real in-progress work here
+        // doesn't get killed partway through.
         tilesDone++;
-        window.parent.postMessage({ type: 'enlarger-progress', done: tilesDone, total: totalTiles }, location.origin);
+        self.postMessage({ type: 'enlarger-progress', done: tilesDone, total: totalTiles });
 
         await new Promise(function (r) { setTimeout(r, 0); }); // yield between tiles
       }
@@ -2246,7 +2241,7 @@
         chw[i] = r; chw[plane + i] = g; chw[plane * 2 + i] = b;
       }
     }
-    return new window.ort.Tensor('float32', chw, [1, 3, height, width]);
+    return new self.ort.Tensor('float32', chw, [1, 3, height, width]);
   }
 
   function tensorToImageData(tensor, channelOrder) {
@@ -2265,8 +2260,6 @@
     }
     return out;
   }
-})();
-</script>
 `;
 
   // ---- Enlarger hand-off (upscale pass before Card Conjurer even opens) -
@@ -2279,43 +2272,41 @@
   // anything about the hand-off fails, this calls back with null and the
   // caller proceeds without an upscale pass — never a hard blocker to
   // getting the card into Card Conjurer at all.
-  // Tiled model inference (see runTiledInference in ENLARGER_HTML) can
-  // legitimately take minutes on a full card image — a 23-block RRDBNet
-  // forward pass per ~128px tile, dozens to 100+ tiles, on WASM CPU
-  // (single-threaded: the hidden iframe has no cross-origin-isolation
-  // headers, so onnxruntime-web can't use SharedArrayBuffer threading).
-  // A single fixed timeout can't tell "still working" apart from "stuck",
+  // Tiled model inference (see runTiledInference in ENLARGER_WORKER_SCRIPT)
+  // can legitimately take minutes on a full card image — a 23-block
+  // RRDBNet forward pass per ~128px tile, dozens to 100+ tiles, on WASM
+  // CPU (no threading available to onnxruntime-web itself: no cross-
+  // origin-isolation headers for SharedArrayBuffer) — but it now runs in
+  // a dedicated Worker instead of a same-thread hidden iframe, so however
+  // long it takes, it no longer freezes the tab (confirmed live: before
+  // this, a full card image froze the whole tab for minutes). A single
+  // fixed timeout still can't tell "still working" apart from "stuck",
   // and a short one kills real progress before it finishes — confirmed
-  // live: the old flat 20s timeout fired mid-inference, so the queue job
-  // finished as "Ready" with a null result blob (see finishQueueJob) and
-  // silently no upscaled art ever reached Card Conjurer. Instead: a short
-  // timeout to catch total failures (iframe never loads/responds at all),
-  // reset on every enlarger-progress ping from ENLARGER_HTML so it only
-  // fires on an actual stall, and a generous hard ceiling so a genuinely
-  // stuck run doesn't hang forever.
+  // live earlier in this same fix's history: a flat 20s timeout fired
+  // mid-inference, so the queue job finished as "Ready" with a null
+  // result blob (see finishQueueJob) and silently no upscaled art ever
+  // reached Card Conjurer. Instead: a short timeout to catch total
+  // failures (worker never responds at all), reset on every
+  // enlarger-progress ping from ENLARGER_WORKER_SCRIPT so it only fires
+  // on an actual stall, and a generous hard ceiling so a genuinely stuck
+  // run doesn't hang forever.
   const HANDOFF_START_TIMEOUT_MS = 30000;
   const HANDOFF_IDLE_TIMEOUT_MS = 20000;
   const HANDOFF_MAX_TOTAL_MS = 5 * 60 * 1000;
 
   function upscaleViaEnlarger(source, callback) {
-    // location.origin — not a configured URL's origin — since a blob:
-    // iframe's own location.origin, and the origin the parent sees on its
-    // postMessage replies, both inherit this page's real origin (verified
-    // directly, see the ENLARGER_HTML comment above).
-    const enlargerOrigin = location.origin;
-
     function sendHandoff(dataUrlOrUrl, isDataUrl) {
-      const blobUrl = URL.createObjectURL(new Blob([ENLARGER_HTML], { type: 'text/html' }));
-      const iframe = document.createElement('iframe');
-      iframe.style.display = 'none';
+      const blobUrl = URL.createObjectURL(new Blob([ENLARGER_WORKER_SCRIPT], { type: 'application/javascript' }));
+      const worker = new Worker(blobUrl);
       let done = false;
       let timeoutId = null;
       const startedAt = Date.now();
 
       function cleanup() {
-        window.removeEventListener('message', onMessage);
+        worker.removeEventListener('message', onMessage);
+        worker.removeEventListener('error', onError);
         if (timeoutId) clearTimeout(timeoutId);
-        if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
+        worker.terminate();
         URL.revokeObjectURL(blobUrl);
       }
 
@@ -2332,8 +2323,10 @@
         }, Math.min(ms, remaining));
       }
 
+      // No origin/source check needed here the way the old cross-frame
+      // postMessage listener required — a dedicated Worker is a private
+      // channel to whoever constructed it, not a shared/broadcast one.
       function onMessage(event) {
-        if (event.origin !== enlargerOrigin || event.source !== iframe.contentWindow) return;
         const data = event.data;
         if (!data) return;
         if (data.type === 'enlarger-progress') {
@@ -2348,56 +2341,63 @@
         cleanup();
         callback(data.blob || null);
       }
-      window.addEventListener('message', onMessage);
+      worker.addEventListener('message', onMessage);
 
-      iframe.addEventListener('load', function () {
-        const payload = { type: 'enlarger-load', scale: getUpscaleTargetScale() };
-        if (isDataUrl) payload.dataUrl = dataUrlOrUrl;
-        else payload.url = dataUrlOrUrl;
-        // Bundled Ultramix by default, the user's own configured model if
-        // they've set one, or omitted entirely (classical-resize fallback)
-        // — see resolveUpscaleModelUrl. This was previously never wired
-        // through at all, so runCustomModel's ONNX path was unreachable
-        // regardless of configuration.
-        const modelUrl = resolveUpscaleModelUrl();
-        if (!modelUrl) {
-          iframe.contentWindow.postMessage(payload, enlargerOrigin);
-          return;
-        }
-        if (modelUrl.indexOf('blob:') === 0) {
-          // A GM_getResourceURL blob: URL (the bundled Ultramix model) is
-          // only fetchable from the Document that created it — confirmed
-          // empirically, the hidden Enlarger iframe's own fetch() of it
-          // throws "NetworkError when attempting to fetch resource" even
-          // though it's nominally same-origin. Fetch the bytes here,
-          // where the blob: URL *is* valid, and transfer them across as
-          // an ArrayBuffer instead — onnxruntime-web's
-          // InferenceSession.create() accepts a byte array directly, so
-          // the iframe never needs to fetch anything itself for this path.
-          fetch(modelUrl)
-            .then(function (r) { return r.arrayBuffer(); })
-            .then(function (buf) {
-              // Confirms real bytes actually arrived, not just that
-              // fetch() didn't throw — an empty/truncated buffer would
-              // otherwise pass through silently as a "no warning" false
-              // positive.
-              console.log('cc-bridge: bundled Ultramix model loaded,', buf.byteLength, 'bytes');
-              payload.modelBytes = buf;
-              iframe.contentWindow.postMessage(payload, enlargerOrigin, [buf]);
-            })
-            .catch(function () {
-              // Bundled model bytes unreachable for some reason — proceed
-              // without a model rather than blocking the handoff.
-              iframe.contentWindow.postMessage(payload, enlargerOrigin);
-            });
-          return;
-        }
+      // A worker-level failure (syntax error, an exception the worker's
+      // own try/catch chain didn't handle) — same never-block guarantee
+      // as the timeout.
+      function onError() {
+        if (done) return;
+        done = true;
+        cleanup();
+        callback(null);
+      }
+      worker.addEventListener('error', onError);
+
+      const payload = { type: 'enlarger-load', scale: getUpscaleTargetScale() };
+      if (isDataUrl) payload.dataUrl = dataUrlOrUrl;
+      else payload.url = dataUrlOrUrl;
+      // Bundled Ultramix by default, the user's own configured model if
+      // they've set one, or omitted entirely (classical-resize fallback)
+      // — see resolveUpscaleModelUrl.
+      const modelUrl = resolveUpscaleModelUrl();
+      if (!modelUrl) {
+        worker.postMessage(payload);
+      } else if (modelUrl.indexOf('blob:') === 0) {
+        // A GM_getResourceURL blob: URL (the bundled Ultramix model) is
+        // only fetchable from the Document that created it — confirmed
+        // empirically against the old hidden-iframe version of this code
+        // ("NetworkError when attempting to fetch resource" from inside
+        // the iframe, even though it was nominally same-origin; a Worker
+        // is its own separate global context too, so the same restriction
+        // applies here). Fetch the bytes in the top page, where the blob:
+        // URL *is* valid, and transfer them into the worker as an
+        // ArrayBuffer instead — onnxruntime-web's InferenceSession.create()
+        // accepts a byte array directly, so the worker never needs to
+        // fetch anything itself for this path.
+        fetch(modelUrl)
+          .then(function (r) { return r.arrayBuffer(); })
+          .then(function (buf) {
+            // Confirms real bytes actually arrived, not just that
+            // fetch() didn't throw — an empty/truncated buffer would
+            // otherwise pass through silently as a "no warning" false
+            // positive.
+            console.log('cc-bridge: bundled Ultramix model loaded,', buf.byteLength, 'bytes');
+            payload.modelBytes = buf;
+            worker.postMessage(payload, [buf]);
+          })
+          .catch(function () {
+            // Bundled model bytes unreachable for some reason — proceed
+            // without a model rather than blocking the handoff.
+            worker.postMessage(payload);
+          });
+      } else {
         // A real http(s) URL (the user's own custom model) — fetched
-        // directly by the iframe itself, same as any other cross-origin
-        // CORS-enabled request; no blob: cross-Document restriction here.
+        // directly by the worker itself, same as any other cross-origin
+        // CORS-enabled request; no blob: cross-context restriction here.
         payload.modelUrl = modelUrl;
-        iframe.contentWindow.postMessage(payload, enlargerOrigin);
-      });
+        worker.postMessage(payload);
+      }
 
       // Never let a slow/broken upscale pass block getting the card into
       // Card Conjurer at all — fall through to no-upscale instead. Starts
@@ -2405,9 +2405,6 @@
       // scheduleTimeout on each enlarger-progress ping once tiled
       // inference actually gets going.
       scheduleTimeout(HANDOFF_START_TIMEOUT_MS);
-
-      iframe.src = blobUrl;
-      document.body.appendChild(iframe);
     }
 
     if (source.file) {
