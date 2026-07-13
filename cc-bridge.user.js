@@ -2457,7 +2457,15 @@
   // enlarger-progress ping from ENLARGER_WORKER_SCRIPT so it only fires
   // on an actual stall, and a generous hard ceiling so a genuinely stuck
   // run doesn't hang forever.
-  const HANDOFF_START_TIMEOUT_MS = 30000;
+  // Cold-start budget before the *first* enlarger-progress ping: fetching
+  // the bundled 67MB model bytes, loading onnxruntime-web, and building an
+  // InferenceSession from those bytes (single-threaded, see numThreads=1
+  // in ensureOrtLoaded) all happen before tiling even begins -- confirmed
+  // live this can genuinely exceed 30s, and that timeout firing was
+  // itself silent (see the console.warn added below), indistinguishable
+  // from a real failure. 90s gives real cold-start room without the hard
+  // 5-minute ceiling changing.
+  const HANDOFF_START_TIMEOUT_MS = 90000;
   const HANDOFF_IDLE_TIMEOUT_MS = 20000;
   const HANDOFF_MAX_TOTAL_MS = 5 * 60 * 1000;
 
@@ -2483,11 +2491,22 @@
       function scheduleTimeout(ms) {
         if (timeoutId) clearTimeout(timeoutId);
         const remaining = Math.max(0, HANDOFF_MAX_TOTAL_MS - (Date.now() - startedAt));
+        const effectiveMs = Math.min(ms, remaining);
         timeoutId = setTimeout(function () {
           if (done) return;
+          // This path was previously completely silent -- confirmed live:
+          // a run that never got as far as its first enlarger-progress
+          // ping (cold model load + session creation taking longer than
+          // the old 30s start window) produced a "Ready" queue job with a
+          // null result blob and zero console output anywhere, identical
+          // in appearance to a real pipeline failure.
+          console.warn(
+            'cc-bridge: Enlarger hand-off timed out after', Date.now() - startedAt,
+            'ms with no result (waited', effectiveMs, 'ms since the last progress ping) -- falling back to no upscale.'
+          );
           cleanup();
           callback(null);
-        }, Math.min(ms, remaining));
+        }, effectiveMs);
       }
 
       // No origin/source check needed here the way the old cross-frame
