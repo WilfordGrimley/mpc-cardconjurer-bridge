@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.20.0
+// @version      0.21.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -351,6 +351,25 @@
   // (which consumes this) lives after the early return too.
   let pendingScryfallCard = null;
   let pendingIsFullArtFlow = false;
+
+  // Set-specific full-art basic land pack lookup (see determineFrameSelection
+  // further down) — same TDZ-safe placement as the above: a plain `const`
+  // object literal's initializer statement never executes in the receiver
+  // context if placed after the early return, even though it's referenced
+  // from a hoisted function declaration (determineFrameSelection) that CAN
+  // be called early. Confirmed the hard way: referencing this from the
+  // receiver threw "Cannot access 'BASIC_LAND_PACK_BY_SET' before
+  // initialization" on every import.
+  const BASIC_LAND_PACK_BY_SET = {
+    eoe: 'EOEBasics',
+    neo: 'NeoBasics',
+    snc: 'TextlessBasicsSNC',
+    thb: 'TextlessBasics',
+    zen: 'ZendikarBasic-1',
+    unf: 'Unfinity',
+    ust: 'Unstable',
+    unh: 'Unhinged',
+  };
 
   if (location.origin === getCCOrigin()) {
     // Only reskin when actually embedded via our own modal — a user who
@@ -744,6 +763,50 @@
   // Draconic, Paranormal, etc.) since which *specific* one applies isn't
   // reliably derivable from Scryfall's card-level fields, and the generic
   // showcase frame below is still much closer than the plain frame.
+  // Universes Beyond crossover status (Lord of the Rings, Doctor Who,
+  // Fallout, Final Fantasy, Assassin's Creed, etc.) — confirmed directly
+  // against real cards from every one of those sets: Scryfall's
+  // promo_types array includes 'universesbeyond' on every UB printing,
+  // including plain (non-promo-variant) main-set cards, not just special
+  // promos (also Scryfall's own `is:ub` search shortcut maps to this same
+  // field). Card Conjurer's "UniversesBeyond" frame group ships its own
+  // parallel set of packs (UB/UBFull/UBExtendedArt, plus UB-specific
+  // structural packs for several — not all — layouts below); routing a UB
+  // card through the generic MTG-native packs instead renders the wrong
+  // frame art for a meaningful slice of real cards.
+  function isUniversesBeyond(scryfallCardData) {
+    const promoTypes = scryfallCardData.promo_types || [];
+    return promoTypes.indexOf('universesbeyond') !== -1;
+  }
+
+  // Full-art basic land color, by the land's own produced color rather
+  // than deriveColorFrameName's colors-array logic (a basic land's own
+  // `colors` is always [] — it has no color identity, only the mana it
+  // produces) — confirmed against real cards (Plains/Island/Swamp/
+  // Mountain/Forest all report colors:[] but produced_mana:['W'/'U'/'B'/
+  // 'R'/'G'] respectively). Textless-4's basic-land packs (confirmed by
+  // reading them directly) use the same "White/Blue/Black/Red/Green
+  // Frame" naming convention as everywhere else, just keyed off this
+  // instead.
+  function deriveBasicLandColorFrameName(scryfallCardData) {
+    const producedMana = scryfallCardData.produced_mana || [];
+    const names = { W: 'White', U: 'Blue', B: 'Black', R: 'Red', G: 'Green' };
+    if (producedMana.length === 1 && names[producedMana[0]]) {
+      return names[producedMana[0]] + ' Frame';
+    }
+    return 'Colorless Frame'; // Wastes and other edge-case basics.
+  }
+
+  // Set-specific full-art basic land pack lookup (BASIC_LAND_PACK_BY_SET)
+  // is declared at top-of-scope, before the early return — see that
+  // declaration's own comment for why. Only sets with a confirmed exact
+  // pack (checked by reading groupTextless-4.js and each listed pack
+  // script directly) are listed there; anything else falls back to the
+  // generic modern style (TextlessBasics2022 / its UB counterpart) below
+  // — an honest gap for the many full-art basics Textless-4 doesn't have
+  // a dedicated pack for (only a fraction of real full-art basic sets are
+  // covered by Card Conjurer's own catalog at all).
+
   function determineFrameSelection(scryfallCardData) {
     if (!scryfallCardData) return null;
     const layout = scryfallCardData.layout || '';
@@ -752,15 +815,26 @@
     const frameEffects = scryfallCardData.frame_effects || [];
     const keywords = scryfallCardData.keywords || [];
     const colorName = deriveColorFrameName(scryfallCardData);
+    const isUB = isUniversesBeyond(scryfallCardData);
 
     // --- layouts that need their own frame *elements* (extra art/text
     // slots, different text positions) — a plain M15 frame renders wrong
-    // or incomplete for these, not just cosmetically different ---
-    if (layout === 'saga') return { group: 'Saga-1', pack: 'SagaRegular' };
+    // or incomplete for these, not just cosmetically different. Where
+    // UniversesBeyond has a confirmed matching structural pack, a UB card
+    // routes there instead of the generic one; where it doesn't (no
+    // Planeswalker/Battle/Token/Leveler/Adventure/Flip/Prototype/
+    // Attraction/Aftermath/plain-Split UB pack found in Card Conjurer's
+    // own catalog), this falls back to the generic pack — an honest gap,
+    // not a silent wrong answer. ---
+    if (layout === 'saga') {
+      return isUB ? { group: 'UniversesBeyond', pack: 'SagaUB', manualFrameName: colorName } : { group: 'Saga-1', pack: 'SagaRegular' };
+    }
     if (typeLine.indexOf('Planeswalker') !== -1) {
       return { group: 'Planeswalker', pack: 'PlaneswalkerRegular' };
     }
-    if (layout === 'modal_dfc') return { group: 'Modal-1', pack: 'ModalRegular' };
+    if (layout === 'modal_dfc') {
+      return isUB ? { group: 'UniversesBeyond', pack: 'ModalUB', manualFrameName: colorName } : { group: 'Modal-1', pack: 'ModalRegular' };
+    }
     if (typeLine.indexOf('Battle') !== -1) {
       // Battles report layout:'transform' in Scryfall's data (same as
       // ordinary DFCs) — checked via type_line, before the transform case
@@ -769,12 +843,18 @@
     }
     // Front face only — a transform card's back face isn't part of this
     // import (MPC Autofill sources front/back as separate card slots).
-    if (layout === 'transform') return { group: 'DFC', pack: 'M15TransformFront' };
+    if (layout === 'transform') {
+      return isUB ? { group: 'UniversesBeyond', pack: 'M15TransformUBFront', manualFrameName: colorName } : { group: 'DFC', pack: 'M15TransformFront' };
+    }
     if (layout === 'token' || typeLine.indexOf('Token') !== -1) {
       return { group: 'Token-2', pack: 'TokenRegular-1' };
     }
-    if (layout === 'class') return { group: 'Standard-3', pack: 'Class', manualFrameName: colorName };
-    if (layout === 'case') return { group: 'Standard-3', pack: 'Case', manualFrameName: colorName };
+    if (layout === 'class') {
+      return isUB ? { group: 'UniversesBeyond', pack: 'ClassUB', manualFrameName: colorName } : { group: 'Standard-3', pack: 'Class', manualFrameName: colorName };
+    }
+    if (layout === 'case') {
+      return isUB ? { group: 'UniversesBeyond', pack: 'CaseUB', manualFrameName: colorName } : { group: 'Standard-3', pack: 'Case', manualFrameName: colorName };
+    }
     if (layout === 'leveler') return { group: 'Standard-3', pack: 'Leveler', manualFrameName: colorName };
     if (layout === 'adventure') return { group: 'Standard-3', pack: 'Adventure', manualFrameName: colorName };
     if (layout === 'flip') return { group: 'Standard-3', pack: 'Flip', manualFrameName: colorName };
@@ -784,7 +864,7 @@
       // Room and Aftermath both report layout:'split' too, so they have to
       // be distinguished before falling through to a plain Split frame.
       if (typeLine.indexOf('Room') !== -1) {
-        return { group: 'Standard-3', pack: 'Room', manualFrameName: colorName };
+        return isUB ? { group: 'UniversesBeyond', pack: 'RoomUB', manualFrameName: colorName } : { group: 'Standard-3', pack: 'Room', manualFrameName: colorName };
       }
       if (keywords.indexOf('Aftermath') !== -1) {
         return { group: 'Standard-3', pack: 'Aftermath', manualFrameName: colorName };
@@ -796,18 +876,50 @@
     // frame below would still render a complete, correct card, so these
     // are opportunistic upgrades. Checked most-visually-distinct first. ---
     if (frameEffects.indexOf('showcase') !== -1) {
+      // Card Conjurer's UniversesBeyond group has no dedicated showcase
+      // pack of its own (checked its full pack list directly) — the
+      // generic showcase frame is the closest available match for a UB
+      // showcase card too, same honest-gap reasoning as the structural
+      // cases above.
       return { group: 'Showcase-5', pack: 'GenericShowcase', manualFrameName: colorName };
+    }
+    // Full-art basic lands: Card Conjurer's Textless-4 group has
+    // purpose-built, set-specific packs for these (confirmed by reading
+    // the pack scripts directly) — much closer than the generic
+    // FullArtNew autoFrame path below, which has no land-specific bounds
+    // or style at all. Checked before the general full_art case so basics
+    // get this more specific treatment.
+    if (scryfallCardData.full_art && typeLine.indexOf('Basic') !== -1 && typeLine.indexOf('Land') !== -1) {
+      const setCode = (scryfallCardData.set || '').toLowerCase();
+      const pack = BASIC_LAND_PACK_BY_SET[setCode] || (isUB ? 'TextlessBasics2022UB' : 'TextlessBasics2022');
+      return { group: 'Textless-4', pack: pack, manualFrameName: deriveBasicLandColorFrameName(scryfallCardData) };
     }
     // Legendary crowns etc. aren't handled here at all: autoFrame()'s own
     // buildAutoFrames() already detects "legendary"/"snow"/nyx-enchantment
     // straight from the type line and adds them automatically, for any of
     // these #autoFrame choices (confirmed: Borderless and FullArtNew both
     // have supportsCrown: true in autoFrame.js) — no extra logic needed.
+    // This doesn't apply to the UniversesBeyond branches just below, which
+    // use manualFrameName (not #autoFrame) — Card Conjurer does ship
+    // UBLegendCrowns/UBLegendCrownsFloating addon packs for those, but
+    // wiring manual addon-frame stacking (as opposed to a single base
+    // pack selection) is a larger change than this pass covers; a UB
+    // legendary full-art/borderless card will render without its crown
+    // until that's added — acknowledged gap, not silently "handled."
     if (scryfallCardData.full_art) {
-      return { group: 'Standard-3', pack: 'M15Regular-1', autoFrame: 'FullArtNew' };
+      return isUB
+        ? { group: 'UniversesBeyond', pack: 'UBFull', manualFrameName: colorName }
+        : { group: 'Standard-3', pack: 'M15Regular-1', autoFrame: 'FullArtNew' };
     }
     if (scryfallCardData.border_color === 'borderless') {
-      return { group: 'Standard-3', pack: 'M15Regular-1', autoFrame: 'Borderless' };
+      // UniversesBeyond has no pack literally named "borderless" (checked
+      // its full pack list directly) — only UB (regular)/UBFull/
+      // UBExtendedArt. UBExtendedArt is the closest visual match (wide
+      // art, no visible frame border) for a UB card that's borderless but
+      // not full-art; still an approximation, not a confirmed exact match.
+      return isUB
+        ? { group: 'UniversesBeyond', pack: 'UBExtendedArt', manualFrameName: colorName }
+        : { group: 'Standard-3', pack: 'M15Regular-1', autoFrame: 'Borderless' };
     }
     // Historical border eras. '2015' is the modern border (the plain
     // default below); 'future' (Future Sight full-art frame) isn't handled
@@ -824,6 +936,27 @@
       return { group: 'Standard-3', pack: 'M15Regular-1', autoFrame: 'Seventh' };
     }
 
+    // Plain UB card with no other cosmetic distinction (e.g. a regular
+    // black-border UB card with the modern frame otherwise) — still wants
+    // UB's own frame art (checked: distinct image asset paths from the
+    // MTG-native M15Regular-1 pack), not just a fallback.
+    if (isUB) {
+      return { group: 'UniversesBeyond', pack: 'UB', manualFrameName: colorName };
+    }
+
+    // Deliberately deferred, not attempted this pass: switching the
+    // default plain-card family from Standard-3/M15Regular-1 to the
+    // "Accurate" group's M15RegularNew (confirmed to be genuinely
+    // different, newer image assets — /img/frames/m15/new/... vs
+    // /img/frames/m15/regular/...  — not a navigational alias for the
+    // same pack). Whether it's actually more correct needs an
+    // asset-by-asset visual comparison across many real cards (crowns,
+    // nyx, snow, PT boxes, etc. all have their own addon packs under both
+    // families, and only Standard-3's has been in production use here) —
+    // rushing that swap risks silently regressing cases this function
+    // already gets right today, which the honesty bar for this pass
+    // explicitly rules out. Revisit with real screenshot-comparison time
+    // budgeted, not folded into this change.
     return { group: 'Standard-3', pack: 'M15Regular-1', autoFrame: 'M15Regular-1' };
   }
 
