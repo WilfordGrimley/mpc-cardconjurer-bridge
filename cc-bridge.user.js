@@ -2101,6 +2101,16 @@
         });
       })
       .catch(function (err) {
+        // A failure here previously vanished with zero visibility -- sent
+        // back via postMessage but never logged anywhere, on either side
+        // of the channel. Confirmed live: a run silently produced a null
+        // blob with none of runCustomModel's own "falling back to
+        // classical resize" warning either, meaning the failure happened
+        // somewhere runCustomModel's own .catch never got a chance to see
+        // it (e.g. a synchronous throw before it returned a promise at
+        // all). Always log here regardless of where in the chain it came
+        // from.
+        console.error('Enlarger: upscale pipeline failed:', err);
         self.postMessage({ type: 'enlarger-result', blob: null, cardData: cardData, error: err.message });
       });
   });
@@ -2313,8 +2323,20 @@
     // entirely -- it needs SharedArrayBuffer/cross-origin-isolation this
     // page doesn't have anyway, so there's no reason to let it even try
     // that path and hit the same class of resolution failure again.
-    self.ort.env.wasm.wasmPaths = ORT_CDN_URL.slice(0, ORT_CDN_URL.lastIndexOf('/') + 1);
-    self.ort.env.wasm.numThreads = 1;
+    //
+    // Guarded: self.ort existing (checked above, importScripts didn't
+    // throw) doesn't guarantee self.ort.env.wasm is already the plain
+    // object this assumes -- if it isn't, failing this config step
+    // shouldn't take down the whole pipeline with a confusing, unlogged
+    // error. Confirmed live: a prior version of this exact assignment,
+    // unguarded, produced a completely silent null result with no
+    // console output on either side of the worker channel at all.
+    try {
+      self.ort.env.wasm.wasmPaths = ORT_CDN_URL.slice(0, ORT_CDN_URL.lastIndexOf('/') + 1);
+      self.ort.env.wasm.numThreads = 1;
+    } catch (e) {
+      console.warn('Enlarger: could not configure onnxruntime-web wasm paths, proceeding with its defaults:', e);
+    }
     return Promise.resolve();
   }
 
@@ -2482,6 +2504,11 @@
           return;
         }
         if (data.type !== 'enlarger-result') return;
+        // Same silent-failure gap as the worker's own catch (see there):
+        // data.error existed on this message type already but nothing on
+        // either side ever logged it, so a null result and a genuine
+        // pipeline failure were indistinguishable from the console.
+        if (data.error) console.warn('cc-bridge: Enlarger reported an error:', data.error);
         done = true;
         cleanup();
         callback(data.blob || null);
@@ -2491,8 +2518,9 @@
       // A worker-level failure (syntax error, an exception the worker's
       // own try/catch chain didn't handle) — same never-block guarantee
       // as the timeout.
-      function onError() {
+      function onError(event) {
         if (done) return;
+        console.error('cc-bridge: Enlarger worker failed:', event.message || event);
         done = true;
         cleanup();
         callback(null);
