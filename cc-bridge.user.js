@@ -432,7 +432,14 @@
 
       if (!data || typeof data.name !== 'string' || !data.name) return;
       senderOrigin = event.origin; // Real origin from the message itself, not a cross-origin read.
-      if (data.customArtBlob) pendingCustomArtBlob = data.customArtBlob;
+      if (data.customArtBlob) {
+        pendingCustomArtBlob = data.customArtBlob;
+        // Diagnostic: confirms the Blob actually crossed into the Card
+        // Conjurer iframe (structured-clone postMessage from a real
+        // cross-origin frame, not the same-document case openEditorModal
+        // itself runs in).
+        console.log('cc-bridge: receiver got customArtBlob,', data.customArtBlob.size, 'bytes,', data.customArtBlob.type);
+      }
       if (data.scryfallCard) pendingScryfallCard = data.scryfallCard;
       pendingIsFullArtFlow = !!data.isFullArtFlow;
       const key = JSON.stringify(data);
@@ -643,7 +650,19 @@
   // like a remote one, and 'autoFit' sizes/positions it the same way a
   // real Scryfall art_crop would be.
   function applyPendingCustomArt() {
-    if (!pendingCustomArtBlob || typeof pageWindow.uploadArt !== 'function') return;
+    if (!pendingCustomArtBlob || typeof pageWindow.uploadArt !== 'function') {
+      // Diagnostic: this is the actual silent-failure branch -- it used
+      // to return with zero output either way, so "art just didn't show
+      // up" and "nothing to apply in the first place" were
+      // indistinguishable from the console.
+      console.warn(
+        'cc-bridge: applyPendingCustomArt skipped -- pendingCustomArtBlob:',
+        !!pendingCustomArtBlob,
+        'uploadArt is a function:', typeof pageWindow.uploadArt === 'function'
+      );
+      return;
+    }
+    console.log('cc-bridge: applying pending custom art,', pendingCustomArtBlob.size, 'bytes');
     const url = URL.createObjectURL(pendingCustomArtBlob);
     pendingCustomArtBlob = null; // Consumed — don't reapply on a later re-import in the same session.
     applyCustomArtRobust(url, 4);
@@ -3074,7 +3093,15 @@
     // round-trip needed. Applied inside Card Conjurer after its own
     // Scryfall auto-art-fetch settles (doFillCardConjurerImport), so this
     // overrides it rather than racing it.
-    if (customArtBlob) payload.customArtBlob = customArtBlob;
+    if (customArtBlob) {
+      payload.customArtBlob = customArtBlob;
+      // Diagnostic: confirms the queue job's resultBlob actually made it
+      // this far (a real Blob with a real size) before being handed to
+      // the Card Conjurer iframe -- if this doesn't show up at all, the
+      // break is upstream of here (the queue/Enlarger result itself),
+      // not in the apply-to-CC step.
+      console.log('cc-bridge: opening editor with customArtBlob,', customArtBlob.size, 'bytes,', customArtBlob.type);
+    }
     // The card JSON already fetched via fetchScryfallCard (see
     // showArtSourcePopover) — plain data, structured-clone-safe same as
     // everything else here. Lets the receiver hand it straight to Card
