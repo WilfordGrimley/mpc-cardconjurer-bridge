@@ -2257,6 +2257,8 @@
     const stepY = tileSize - overlap * 2;
     const tilesX = Math.max(1, Math.ceil(W / stepX));
     const tilesY = Math.max(1, Math.ceil(H / stepY));
+    const totalTiles = tilesX * tilesY;
+    let tilesDone = 0;
 
     for (let ty = 0; ty < tilesY; ty++) {
       for (let tx = 0; tx < tilesX; tx++) {
@@ -2279,6 +2281,15 @@
         tmp.width = outTile.width; tmp.height = outTile.height;
         tmp.getContext('2d').putImageData(outTile, 0, 0);
         outCtx.drawImage(tmp, destX, destY);
+
+        // A full card image can be 60-100+ tiles, each a real RRDBNet
+        // forward pass — easily minutes of work. The parent's hand-off
+        // timeout (see upscaleViaEnlarger/scheduleTimeout in
+        // cc-bridge.user.js) resets on each of these pings rather than
+        // using one fixed deadline, so real in-progress work here doesn't
+        // get killed partway through.
+        tilesDone++;
+        window.parent.postMessage({ type: 'enlarger-progress', done: tilesDone, total: totalTiles }, location.origin);
 
         await new Promise(function (r) { setTimeout(r, 0); }); // yield between tiles
       }
@@ -2331,6 +2342,24 @@
   // anything about the hand-off fails, this calls back with null and the
   // caller proceeds without an upscale pass — never a hard blocker to
   // getting the card into Card Conjurer at all.
+  // Tiled model inference (see runTiledInference in ENLARGER_HTML) can
+  // legitimately take minutes on a full card image — a 23-block RRDBNet
+  // forward pass per ~128px tile, dozens to 100+ tiles, on WASM CPU
+  // (single-threaded: the hidden iframe has no cross-origin-isolation
+  // headers, so onnxruntime-web can't use SharedArrayBuffer threading).
+  // A single fixed timeout can't tell "still working" apart from "stuck",
+  // and a short one kills real progress before it finishes — confirmed
+  // live: the old flat 20s timeout fired mid-inference, so the queue job
+  // finished as "Ready" with a null result blob (see finishQueueJob) and
+  // silently no upscaled art ever reached Card Conjurer. Instead: a short
+  // timeout to catch total failures (iframe never loads/responds at all),
+  // reset on every enlarger-progress ping from ENLARGER_HTML so it only
+  // fires on an actual stall, and a generous hard ceiling so a genuinely
+  // stuck run doesn't hang forever.
+  const HANDOFF_START_TIMEOUT_MS = 30000;
+  const HANDOFF_IDLE_TIMEOUT_MS = 20000;
+  const HANDOFF_MAX_TOTAL_MS = 5 * 60 * 1000;
+
   function upscaleViaEnlarger(source, callback) {
     // location.origin — not a configured URL's origin — since a blob:
     // iframe's own location.origin, and the origin the parent sees on its
@@ -2344,6 +2373,7 @@
       iframe.style.display = 'none';
       let done = false;
       let timeoutId = null;
+      const startedAt = Date.now();
 
       function cleanup() {
         window.removeEventListener('message', onMessage);
@@ -2352,10 +2382,31 @@
         URL.revokeObjectURL(blobUrl);
       }
 
+      // Reschedules the give-up timer for `ms` from now, capped so the
+      // total time since starting never exceeds HANDOFF_MAX_TOTAL_MS
+      // regardless of how much progress-driven resetting has happened.
+      function scheduleTimeout(ms) {
+        if (timeoutId) clearTimeout(timeoutId);
+        const remaining = Math.max(0, HANDOFF_MAX_TOTAL_MS - (Date.now() - startedAt));
+        timeoutId = setTimeout(function () {
+          if (done) return;
+          cleanup();
+          callback(null);
+        }, Math.min(ms, remaining));
+      }
+
       function onMessage(event) {
         if (event.origin !== enlargerOrigin || event.source !== iframe.contentWindow) return;
         const data = event.data;
-        if (!data || data.type !== 'enlarger-result') return;
+        if (!data) return;
+        if (data.type === 'enlarger-progress') {
+          // Still actively producing tiles — the run isn't stuck, so
+          // extend the window rather than let a fixed deadline cut off
+          // real work in progress.
+          scheduleTimeout(HANDOFF_IDLE_TIMEOUT_MS);
+          return;
+        }
+        if (data.type !== 'enlarger-result') return;
         done = true;
         cleanup();
         callback(data.blob || null);
@@ -2412,12 +2463,11 @@
       });
 
       // Never let a slow/broken upscale pass block getting the card into
-      // Card Conjurer at all — fall through to no-upscale instead.
-      timeoutId = setTimeout(function () {
-        if (done) return;
-        cleanup();
-        callback(null);
-      }, 20000);
+      // Card Conjurer at all — fall through to no-upscale instead. Starts
+      // at the short "did anything happen at all" window; extended by
+      // scheduleTimeout on each enlarger-progress ping once tiled
+      // inference actually gets going.
+      scheduleTimeout(HANDOFF_START_TIMEOUT_MS);
 
       iframe.src = blobUrl;
       document.body.appendChild(iframe);
