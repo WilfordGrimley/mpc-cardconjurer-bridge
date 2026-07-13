@@ -2051,6 +2051,7 @@
   // them, not a shared/broadcast one the way cross-frame postMessage is).
   const ENLARGER_WORKER_SCRIPT = `
   'use strict';
+  console.log("cc-bridge-worker: script started");
 
   // onnxruntime-web's own internal WASM-backend init tries several CDN
   // fallback paths and can leave a stray rejected promise behind even
@@ -2059,7 +2060,7 @@
   // only about not letting a third-party library's internals surface as
   // a raw uncaught error in this tab.
   self.addEventListener('unhandledrejection', function (event) {
-    console.warn('Enlarger: suppressed an unhandled promise rejection (likely onnxruntime-web internals):', event.reason);
+    console.warn('Enlarger: suppressed an unhandled promise rejection (likely onnxruntime-web internals): ' + (event.reason && event.reason.message ? event.reason.message : String(event.reason)));
     event.preventDefault();
   });
 
@@ -2068,20 +2069,38 @@
   // cc-bridge.user.js). self.postMessage here talks directly back to
   // whoever constructed this worker; no origin/target checking needed
   // the way cross-frame postMessage requires.
+  //
+  // Heavier-than-usual tracing throughout this file for one diagnostic
+  // round: several rounds of targeted logging on specific failure
+  // branches all came back completely silent on live tests, which means
+  // execution was stopping somewhere none of them covered. Logging every
+  // step, not just catches, pins down exactly how far this gets. Primitive
+  // values only (strings/numbers) in every log call here, deliberately --
+  // logging a complex object (a Promise, an Event, an Error) can itself
+  // throw during console's own stringification in some engines, and that
+  // throw can be silent in a Worker context -- which would otherwise look
+  // identical to the very silence this is trying to diagnose.
   self.addEventListener('message', function (event) {
+    console.log("cc-bridge-worker: message received, type: " + (event.data && event.data.type || "unknown"));
     const data = event.data;
     if (!data || data.type !== 'enlarger-load') return;
     const cardData = data.cardData || null;
     const scaleFactor = typeof data.scale === 'number' && data.scale > 0 ? data.scale : 2;
     const source = data.url || data.dataUrl;
-    if (!source) return;
+    if (!source) {
+      console.warn('cc-bridge-worker: enlarger-load had no url/dataUrl, nothing to do -- this used to return silently with zero message sent back at all.');
+      self.postMessage({ type: 'enlarger-result', blob: null, cardData: cardData, error: 'no source url/dataUrl in enlarger-load message' });
+      return;
+    }
 
     loadImage(source)
       .then(function (bitmap) {
+        console.log("cc-bridge-worker: source image loaded, " + bitmap.width + "x" + bitmap.height);
         const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
         canvas.getContext('2d').drawImage(bitmap, 0, 0);
 
         if (data.modelUrl || data.modelBytes) {
+          console.log('cc-bridge-worker: taking model path');
           return runCustomModel(canvas, data, scaleFactor).catch(function (err) {
             // Any failure in the custom-model path (bad shape, CORS,
             // network, wrong tensor layout) falls back to the built-in
@@ -2089,15 +2108,23 @@
             // loudly, since this is now the default path for every
             // install and a silent degrade-to-Lanczos looks identical to
             // a successful upscale from the output alone.
-            console.warn('Enlarger: model-based upscale failed, falling back to classical resize:', err);
+            console.warn('cc-bridge-worker: model-based upscale failed, falling back to classical resize: ' + (err && err.message ? err.message : String(err)));
             return runBuiltin(canvas, scaleFactor);
           });
         }
+        console.log('cc-bridge-worker: taking classical-resize path (no model configured/enabled)');
         return runBuiltin(canvas, scaleFactor);
       })
       .then(function (resultCanvas) {
+        console.log("cc-bridge-worker: tiled inference/resize complete, result " + resultCanvas.width + "x" + resultCanvas.height + " -- converting to blob");
         return resultCanvas.convertToBlob({ type: 'image/png' }).then(function (blob) {
-          self.postMessage({ type: 'enlarger-result', blob: blob, cardData: cardData });
+          console.log("cc-bridge-worker: blob conversion complete, size: " + blob.size);
+          console.log('cc-bridge-worker: about to postMessage result');
+          try {
+            self.postMessage({ type: 'enlarger-result', blob: blob, cardData: cardData });
+          } catch (e) {
+            console.error("cc-bridge-worker: postMessage of result threw: " + (e && e.message ? e.message : String(e)));
+          }
         });
       })
       .catch(function (err) {
@@ -2110,10 +2137,19 @@
         // it (e.g. a synchronous throw before it returned a promise at
         // all). Always log here regardless of where in the chain it came
         // from.
-        console.error('Enlarger: upscale pipeline failed:', err);
-        self.postMessage({ type: 'enlarger-result', blob: null, cardData: cardData, error: err.message });
+        const message = err && err.message ? err.message : String(err);
+        console.error('cc-bridge-worker: upscale pipeline failed: ' + message);
+        try {
+          self.postMessage({ type: 'enlarger-result', blob: null, cardData: cardData, error: message });
+        } catch (e) {
+          console.error("cc-bridge-worker: postMessage of failure result threw: " + (e && e.message ? e.message : String(e)));
+        }
+      })
+      .then(function () {
+        console.log('cc-bridge-worker: message handler reached end');
       });
   });
+  console.log("cc-bridge-worker: message handler registered");
 
   function loadImage(src) {
     // fetch() handles both data: URLs (the "upload my own image" path)
@@ -2151,12 +2187,34 @@
     // model) — InferenceSession.create() accepts either a byte array or a
     // URL directly.
     const modelSource = data.modelBytes ? new Uint8Array(data.modelBytes) : data.modelUrl;
+    console.log("cc-bridge-worker: runCustomModel starting, tileSize=" + tileSize + " nativeScale=" + nativeScale + " modelSource is " + (data.modelBytes ? "bytes (" + modelSource.length + ")" : "url"));
 
     return ensureOrtLoaded()
-      .then(function () { return self.ort.InferenceSession.create(modelSource); })
+      .then(function () {
+        console.log("cc-bridge-worker: about to create InferenceSession");
+        return self.ort.InferenceSession.create(modelSource)
+          .then(function (session) {
+            console.log("cc-bridge-worker: InferenceSession created");
+            return session;
+          })
+          .catch(function (e) {
+            // Isolated specifically to this call, not the wider chain --
+            // pins the exact point of a failure that the outer catch
+            // would otherwise report from further downstream, at a
+            // narrower step than "somewhere in ensureOrtLoaded/create/
+            // tiled inference".
+            const message = e && e.message ? e.message : String(e);
+            console.error("cc-bridge-worker: InferenceSession.create() threw: " + message);
+            throw e; // preserve existing fallback-to-classical-resize behavior upstream
+          });
+      })
       .then(function (session) {
         onnxSession = session;
         return runTiledInference(canvas, onnxSession, tileSize, overlap, channelOrder, nativeScale);
+      })
+      .then(function (result) {
+        console.log("cc-bridge-worker: tiled inference complete");
+        return result;
       })
       .then(function (result) {
         if (nativeScale !== scaleFactor) {
@@ -2335,7 +2393,7 @@
       self.ort.env.wasm.wasmPaths = ORT_CDN_URL.slice(0, ORT_CDN_URL.lastIndexOf('/') + 1);
       self.ort.env.wasm.numThreads = 1;
     } catch (e) {
-      console.warn('Enlarger: could not configure onnxruntime-web wasm paths, proceeding with its defaults:', e);
+      console.warn('cc-bridge-worker: could not configure onnxruntime-web wasm paths, proceeding with its defaults: ' + (e && e.message ? e.message : String(e)));
     }
     return Promise.resolve();
   }
@@ -2514,7 +2572,10 @@
       // channel to whoever constructed it, not a shared/broadcast one.
       function onMessage(event) {
         const data = event.data;
-        if (!data) return;
+        if (!data) {
+          console.warn('cc-bridge: got a message from the Enlarger worker with no data at all');
+          return;
+        }
         if (data.type === 'enlarger-progress') {
           // Still actively producing tiles — the run isn't stuck, so
           // extend the window rather than let a fixed deadline cut off
@@ -2522,7 +2583,10 @@
           scheduleTimeout(HANDOFF_IDLE_TIMEOUT_MS);
           return;
         }
-        if (data.type !== 'enlarger-result') return;
+        if (data.type !== 'enlarger-result') {
+          console.warn('cc-bridge: got an unexpected message type from the Enlarger worker:', data.type);
+          return;
+        }
         // Same silent-failure gap as the worker's own catch (see there):
         // data.error existed on this message type already but nothing on
         // either side ever logged it, so a null result and a genuine
@@ -2539,7 +2603,7 @@
       // as the timeout.
       function onError(event) {
         if (done) return;
-        console.error('cc-bridge: Enlarger worker failed:', event.message || event);
+        console.error('cc-bridge: Enlarger worker failed: ' + (event && event.message ? event.message : 'unknown worker error'));
         done = true;
         cleanup();
         callback(null);
@@ -2574,13 +2638,24 @@
             // fetch() didn't throw — an empty/truncated buffer would
             // otherwise pass through silently as a "no warning" false
             // positive.
-            console.log('cc-bridge: bundled Ultramix model loaded,', buf.byteLength, 'bytes');
+            console.log('cc-bridge: bundled Ultramix model loaded, ' + buf.byteLength + ' bytes');
             payload.modelBytes = buf;
-            worker.postMessage(payload, [buf]);
+            try {
+              worker.postMessage(payload, [buf]);
+              console.log('cc-bridge: posted enlarger-load to worker (with modelBytes)');
+            } catch (e) {
+              // This exact catch was previously silent -- if
+              // worker.postMessage itself throws (e.g. a transfer-related
+              // DataCloneError), nothing downstream would ever fire and
+              // there'd be zero console output at all, identical to every
+              // other silent-failure shape hit so far this session.
+              console.error('cc-bridge: worker.postMessage with modelBytes threw: ' + (e && e.message ? e.message : String(e)));
+            }
           })
-          .catch(function () {
-            // Bundled model bytes unreachable for some reason — proceed
-            // without a model rather than blocking the handoff.
+          .catch(function (err) {
+            // Previously silent -- this used to swallow any fetch/
+            // arrayBuffer failure with zero logging.
+            console.warn('cc-bridge: could not fetch bundled model bytes, proceeding without a model: ' + (err && err.message ? err.message : String(err)));
             worker.postMessage(payload);
           });
       } else {
