@@ -2167,10 +2167,22 @@
     // identically either way once loaded.
     try {
       importScripts(ORT_CDN_URL);
-      return Promise.resolve();
     } catch (e) {
       return Promise.reject(new Error('could not load onnxruntime-web'));
     }
+    // onnxruntime-web normally auto-derives where to fetch its sibling
+    // .wasm/.mjs files from its own script's URL -- but this script has
+    // no real one, it's a blob: URL, so that derivation fails. Confirmed
+    // live: "TypeError: Error resolving module specifier
+    // './ort-wasm-simd-threaded.mjs'" followed by every backend failing.
+    // wasmPaths tells it the real absolute base URL explicitly instead of
+    // guessing. numThreads=1 additionally skips the threaded/SIMD variant
+    // entirely -- it needs SharedArrayBuffer/cross-origin-isolation this
+    // page doesn't have anyway, so there's no reason to let it even try
+    // that path and hit the same class of resolution failure again.
+    self.ort.env.wasm.wasmPaths = ORT_CDN_URL.slice(0, ORT_CDN_URL.lastIndexOf('/') + 1);
+    self.ort.env.wasm.numThreads = 1;
+    return Promise.resolve();
   }
 
   // Splits the source into overlapping tiles, runs each through the ONNX
