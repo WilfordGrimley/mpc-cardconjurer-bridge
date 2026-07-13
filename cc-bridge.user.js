@@ -2386,13 +2386,27 @@
   // the bundled 67MB model bytes, loading onnxruntime-web, and building an
   // InferenceSession from those bytes (single-threaded, see numThreads=1
   // in ensureOrtLoaded) all happen before tiling even begins -- confirmed
-  // live this can genuinely exceed 30s, and that timeout firing was
-  // itself silent (see the console.warn added below), indistinguishable
-  // from a real failure. 90s gives real cold-start room without the hard
-  // 5-minute ceiling changing.
+  // live this can genuinely exceed 30s.
+  //
+  // The idle window (between progress pings) turned out to be the real
+  // bottleneck, not the start window: full checkpoint tracing on a live
+  // test (a Steam Deck -- a mobile/handheld-class CPU, not a desktop)
+  // showed InferenceSession created successfully, tiled inference
+  // actually starting (the timeout's own log reported "waited 20000ms
+  // since the last progress ping", which only happens after at least one
+  // real progress ping already arrived and reset the clock to the idle
+  // window), and then simply not finishing a second tile within 20s. A
+  // single RRDBNet tile forward pass, single-threaded WASM (no choice --
+  // no cross-origin-isolation headers for SharedArrayBuffer), plausibly
+  // takes well over 20s on weaker hardware. This was never a hang or a
+  // bug -- every prior silent round was very likely this exact same
+  // thing, just without the timeout log existing yet to say so. Widened
+  // both windows generously: the Worker move means a longer wait no
+  // longer freezes the tab, so tolerating slow hardware is now just a
+  // matter of not giving up too early.
   const HANDOFF_START_TIMEOUT_MS = 90000;
-  const HANDOFF_IDLE_TIMEOUT_MS = 20000;
-  const HANDOFF_MAX_TOTAL_MS = 5 * 60 * 1000;
+  const HANDOFF_IDLE_TIMEOUT_MS = 120000;
+  const HANDOFF_MAX_TOTAL_MS = 20 * 60 * 1000;
 
   function upscaleViaEnlarger(source, callback) {
     function sendHandoff(dataUrlOrUrl, isDataUrl) {
