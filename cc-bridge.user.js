@@ -12,16 +12,24 @@
 // @grant        unsafeWindow
 // @resource     ultramixModel https://raw.githubusercontent.com/WilfordGrimley/mpc-cardconjurer-bridge/3846cf7c803d320144ebf948f36f459e924beda8/models/4x-UltraMix_Balanced.onnx
 // @run-at       document-idle
-// @license      MIT
+// @license      GPL-3.0-or-later
 // ==/UserScript==
+
+// Copyright (C) wilfordgrimley
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version. See the LICENSE file in this
+// repository, or <https://www.gnu.org/licenses/>.
 
 // The @resource above is Kim2091's Ultramix (Balanced) upscaler, converted
 // to ONNX from https://huggingface.co/Kim2091/UltraSharp (Interpolations/
 // 4x-UltraMix_Balanced.pth) — CC-BY-NC-SA-4.0, non-commercial. It's the
 // bundled default for the Enlarger upscale pass (see getUpscaleModelUrl/
-// isBundledUltramixEnabled below); this project's own code stays MIT, but
-// this one bundled asset carries Kim2091's license terms. See
-// THIRD_PARTY_NOTICES.md.
+// isBundledUltramixEnabled below); this project's own code is GPL-3.0-or-
+// later, but this one bundled asset carries Kim2091's license terms
+// separately. See THIRD_PARTY_NOTICES.md.
 
 // NOTE on @match: this is intentionally broad. Tampermonkey/Violentmonkey only
 // ever run a script on origins covered by @match, so the "enable this site"
