@@ -1,7 +1,8 @@
 # Third-party notices
 
-This project's own code is MIT licensed (see the `@license` field in
-`cc-bridge.user.js`). One bundled asset carries different terms:
+This project's own code is GPL-3.0-or-later (see the `@license` field in
+`cc-bridge.user.js` and the `LICENSE` file). One bundled asset carries
+different terms:
 
 ## Ultramix (Balanced) — `models/4x-UltraMix_Balanced.onnx`
 
