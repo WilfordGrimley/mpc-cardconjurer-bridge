@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.26.0
+// @version      0.27.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor panel glued to the clicked card, auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -9,7 +9,9 @@
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @grant        GM_getResourceURL
+// @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
+// @connect      *
 // @resource     ultramixModel https://raw.githubusercontent.com/WilfordGrimley/mpc-cardconjurer-bridge/3846cf7c803d320144ebf948f36f459e924beda8/models/4x-UltraMix_Balanced.onnx
 // @run-at       document-idle
 // @license      GPL-3.0-or-later
@@ -38,6 +40,19 @@
 // comes from the activation gate a few lines down: on any origin that isn't a
 // default or user-enabled MPC Autofill instance, this script does nothing at
 // all beyond registering its two menu commands.
+
+// NOTE on @connect *: GM_xmlhttpRequest (see gmFetchArrayBuffer) is used for
+// exactly one thing — fetching the art image for the one card the user just
+// clicked "+ conjure" on, as bytes, so the Enlarger Worker never has to make
+// its own cross-origin fetch (which is subject to the host page's CSP and can
+// fail even for a URL that page happily <img>-displays — see
+// gmFetchArrayBuffer's own comment). That URL can be Scryfall's art CDN or,
+// for the full-art path, whatever host a given MPC Autofill-style site
+// happens to serve its own card images from — not knowable in advance, hence
+// the wildcard, rather than a fixed per-domain @connect list. Same
+// single-purpose, user-initiated spirit as the Scryfall API exception in
+// CLAUDE.md, just needed for the image the card's own art actually lives at,
+// not only the api.scryfall.com JSON lookup that exception names explicitly.
 
 (function () {
   'use strict';
@@ -2206,6 +2221,45 @@
     return !!(scryfallCard && (scryfallCard.full_art || scryfallCard.border_color === 'borderless'));
   }
 
+  // Fetches an art source URL's bytes via GM_xmlhttpRequest rather than a
+  // plain fetch() — GM_xmlhttpRequest runs in the userscript manager's own
+  // privileged context, not the page's, so it isn't subject to the host
+  // page's Content-Security-Policy connect-src (or CORS) at all. A plain
+  // fetch() to a card's art_crop URL from inside the Enlarger Worker
+  // failed live on a real mpchost site with "NetworkError when attempting
+  // to fetch resource" even though that exact same URL displays fine as
+  // an <img> on that same page — img-src and connect-src are separate CSP
+  // directives, and it's an easy, common gap for a site to allow the
+  // former (so cards render) without the latter (since the page itself
+  // never fetch()es images, only <img>s them) — and a blob:-spawned
+  // Worker inherits its creating Document's CSP either way, so moving the
+  // fetch to the main thread alone wouldn't have helped. Mirrors the
+  // existing GM_getResourceURL-blob-bytes handoff for the bundled
+  // Ultramix model just below (upscaleViaEnlarger) — same shape of fix
+  // for the same shape of problem.
+  function gmFetchArrayBuffer(url) {
+    return new Promise(function (resolve, reject) {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: url,
+        responseType: 'arraybuffer',
+        onload: function (res) {
+          if (res.status >= 200 && res.status < 300 && res.response) {
+            resolve(res.response);
+          } else {
+            reject(new Error('HTTP ' + res.status));
+          }
+        },
+        onerror: function () {
+          reject(new Error('network error'));
+        },
+        ontimeout: function () {
+          reject(new Error('timed out'));
+        },
+      });
+    });
+  }
+
   // The full Enlarger tool, embedded directly — no separate hosting at
   // all. Runs as a dedicated Worker, not a hidden iframe: tiled model
   // inference is a genuinely long synchronous WASM computation per tile
@@ -2257,14 +2311,13 @@
     if (!data || data.type !== 'enlarger-load') return;
     const cardData = data.cardData || null;
     const scaleFactor = typeof data.scale === 'number' && data.scale > 0 ? data.scale : 2;
-    const source = data.url || data.dataUrl;
-    if (!source) {
-      console.warn('cc-bridge-worker: enlarger-load had no url/dataUrl, nothing to do -- this used to return silently with zero message sent back at all.');
-      self.postMessage({ type: 'enlarger-result', blob: null, cardData: cardData, error: 'no source url/dataUrl in enlarger-load message' });
+    if (!data.imageBytes && !data.url && !data.dataUrl) {
+      console.warn('cc-bridge-worker: enlarger-load had no imageBytes/url/dataUrl, nothing to do -- this used to return silently with zero message sent back at all.');
+      self.postMessage({ type: 'enlarger-result', blob: null, cardData: cardData, error: 'no source image in enlarger-load message' });
       return;
     }
 
-    loadImage(source)
+    loadImage(data)
       .then(function (bitmap) {
         console.log("cc-bridge-worker: source image loaded, " + bitmap.width + "x" + bitmap.height);
         const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
@@ -2322,13 +2375,21 @@
   });
   console.log("cc-bridge-worker: message handler registered");
 
-  function loadImage(src) {
-    // fetch() handles both data: URLs (the "upload my own image" path)
-    // and remote http(s) URLs (Scryfall's art CDN, which serves
-    // permissive CORS) uniformly -- no separate crossOrigin flag needed
-    // the way an <img> element required, since a Worker has no <img> at
-    // all. createImageBitmap decodes the fetched bytes directly, no
-    // canvas round-trip needed just to get pixels.
+  function loadImage(data) {
+    // data.imageBytes (an ArrayBuffer, fetched on the main thread via
+    // GM_xmlhttpRequest -- see gmFetchArrayBuffer in cc-bridge.user.js)
+    // takes precedence over fetching a URL ourselves: this Worker's own
+    // fetch() is bound by the host page's CSP the same way the page
+    // itself is (a blob:-spawned Worker inherits its creating Document's
+    // CSP), which can block a same-origin-looking fetch to a host whose
+    // images the page happily <img>-displays elsewhere. data.dataUrl (the
+    // "upload my own image" path -- already a local data: URL, no network
+    // involved) and data.url (fallback, only used if the privileged fetch
+    // itself failed) still go through fetch(), which handles both fine.
+    if (data.imageBytes) {
+      return Promise.resolve(createImageBitmap(new Blob([data.imageBytes])));
+    }
+    const src = data.dataUrl || data.url;
     return fetch(src)
       .then(function (res) {
         if (!res.ok) throw new Error('failed to load source image: ' + res.status);
@@ -2717,7 +2778,12 @@
   // widget) show live tile-by-tile status for a run that can take minutes,
   // instead of just a generic "still working" indicator.
   function upscaleViaEnlarger(source, callback, onProgress) {
-    function sendHandoff(dataUrlOrUrl, isDataUrl) {
+    // imageSource is one of {imageBytes: ArrayBuffer} (privileged-fetched
+    // remote art, or the fallback below), {dataUrl: string} (the "upload
+    // my own image" path), or {url: string} (last-resort fallback if the
+    // privileged fetch itself failed) — see the call sites at the bottom
+    // of this function.
+    function sendHandoff(imageSource) {
       const blobUrl = URL.createObjectURL(new Blob([ENLARGER_WORKER_SCRIPT], { type: 'application/javascript' }));
       const worker = new Worker(blobUrl);
       let done = false;
@@ -2801,14 +2867,44 @@
       worker.addEventListener('error', onError);
 
       const payload = { type: 'enlarger-load', scale: getUpscaleTargetScale() };
-      if (isDataUrl) payload.dataUrl = dataUrlOrUrl;
-      else payload.url = dataUrlOrUrl;
+      // Collected here rather than at each individual postMessage call —
+      // both the art bytes below and the model bytes further down are
+      // Transferable ArrayBuffers, and there's exactly one point (postToWorker)
+      // where the message actually goes out, so both need to land in the
+      // same transfer list regardless of which finishes resolving first.
+      const transferables = [];
+      if (imageSource.imageBytes) {
+        payload.imageBytes = imageSource.imageBytes;
+        transferables.push(imageSource.imageBytes);
+      } else if (imageSource.dataUrl) {
+        payload.dataUrl = imageSource.dataUrl;
+      } else {
+        payload.url = imageSource.url;
+      }
+
+      function postToWorker() {
+        try {
+          worker.postMessage(payload, transferables);
+          console.log(
+            'cc-bridge: posted enlarger-load to worker (imageBytes:', !!payload.imageBytes,
+            'modelBytes:', !!payload.modelBytes, ')'
+          );
+        } catch (e) {
+          // This exact catch was previously silent -- if
+          // worker.postMessage itself throws (e.g. a transfer-related
+          // DataCloneError), nothing downstream would ever fire and
+          // there'd be zero console output at all, identical to every
+          // other silent-failure shape hit so far this session.
+          console.error('cc-bridge: worker.postMessage threw: ' + (e && e.message ? e.message : String(e)));
+        }
+      }
+
       // Bundled Ultramix by default, the user's own configured model if
       // they've set one, or omitted entirely (classical-resize fallback)
       // — see resolveUpscaleModelUrl.
       const modelUrl = resolveUpscaleModelUrl();
       if (!modelUrl) {
-        worker.postMessage(payload);
+        postToWorker();
       } else if (modelUrl.indexOf('blob:') === 0) {
         // A GM_getResourceURL blob: URL (the bundled Ultramix model) is
         // only fetchable from the Document that created it — confirmed
@@ -2830,30 +2926,21 @@
             // positive.
             console.log('cc-bridge: bundled Ultramix model loaded, ' + buf.byteLength + ' bytes');
             payload.modelBytes = buf;
-            try {
-              worker.postMessage(payload, [buf]);
-              console.log('cc-bridge: posted enlarger-load to worker (with modelBytes)');
-            } catch (e) {
-              // This exact catch was previously silent -- if
-              // worker.postMessage itself throws (e.g. a transfer-related
-              // DataCloneError), nothing downstream would ever fire and
-              // there'd be zero console output at all, identical to every
-              // other silent-failure shape hit so far this session.
-              console.error('cc-bridge: worker.postMessage with modelBytes threw: ' + (e && e.message ? e.message : String(e)));
-            }
+            transferables.push(buf);
+            postToWorker();
           })
           .catch(function (err) {
             // Previously silent -- this used to swallow any fetch/
             // arrayBuffer failure with zero logging.
             console.warn('cc-bridge: could not fetch bundled model bytes, proceeding without a model: ' + (err && err.message ? err.message : String(err)));
-            worker.postMessage(payload);
+            postToWorker();
           });
       } else {
         // A real http(s) URL (the user's own custom model) — fetched
         // directly by the worker itself, same as any other cross-origin
         // CORS-enabled request; no blob: cross-context restriction here.
         payload.modelUrl = modelUrl;
-        worker.postMessage(payload);
+        postToWorker();
       }
 
       // Never let a slow/broken upscale pass block getting the card into
@@ -2866,11 +2953,25 @@
 
     if (source.file) {
       const reader = new FileReader();
-      reader.onload = function () { sendHandoff(reader.result, true); };
+      reader.onload = function () { sendHandoff({ dataUrl: reader.result }); };
       reader.onerror = function () { callback(null); };
       reader.readAsDataURL(source.file);
     } else if (source.url) {
-      sendHandoff(source.url, false);
+      // Fetched here, on the privileged side, via GM_xmlhttpRequest
+      // rather than handing the raw URL to the Worker to fetch itself —
+      // see gmFetchArrayBuffer's own comment for why a plain fetch from
+      // inside the Worker can fail even for a URL the page displays fine.
+      // Falls back to letting the Worker try its own fetch if the
+      // privileged request itself fails outright (e.g. GM_xmlhttpRequest
+      // rejected for some unrelated reason) — better an attempt than none.
+      gmFetchArrayBuffer(source.url)
+        .then(function (buf) { sendHandoff({ imageBytes: buf }); })
+        .catch(function (err) {
+          console.warn(
+            'cc-bridge: privileged fetch of art source failed (' + err.message + '), falling back to letting the worker fetch it directly'
+          );
+          sendHandoff({ url: source.url });
+        });
     } else {
       callback(null);
     }
