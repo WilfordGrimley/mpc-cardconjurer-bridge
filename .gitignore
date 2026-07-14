@@ -1,6 +1,8 @@
-CLAUDE.md
+CLAUDE.local.md
 README.md
 FRAME_ACCURACY_PROMPT.md
+journal/
+WORKERS.md
 
 # OS cruft
 .DS_Store
