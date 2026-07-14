@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.23.0
+// @version      0.24.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -3219,26 +3219,6 @@
     const rootEl = btn.closest(CARD_ROOT_SELECTOR);
     if (!rootEl) return;
 
-    // Diagnostic for a live-reported bug: on the printingQueue page, the
-    // queue always shows the reference card's name regardless of which
-    // candidate's conjure button was clicked. This distinguishes two very
-    // different root causes: (a) btn.closest(CARD_ROOT_SELECTOR) resolving
-    // to the wrong element for a candidate click (a selector/DOM-structure
-    // issue on our side, fixable here), vs (b) rootEl being the right
-    // element but its own data-card-name already being wrong in the
-    // page's own markup (not something changing which element we read
-    // would fix). String-only, no DOM/complex objects, per this session's
-    // established logging discipline.
-    console.log(
-      'cc-bridge: handleConjureTrigger -- rootEl tag=' + rootEl.tagName +
-      ' class=' + String(rootEl.getAttribute('class') || '').slice(0, 80) +
-      ' data-card-name=' + rootEl.getAttribute('data-card-name') +
-      ' data-card-set-code=' + rootEl.getAttribute('data-card-set-code') +
-      ' data-card-collector-number=' + rootEl.getAttribute('data-card-collector-number') +
-      ' totalRootMatches=' + document.querySelectorAll(CARD_ROOT_SELECTOR).length +
-      ' btnRootIsSame=' + (btn === rootEl)
-    );
-
     let cardData = extractCardData(rootEl);
     if (!cardData) return;
 
@@ -3252,7 +3232,6 @@
       lastCardSelectedTarget &&
       rootEl.contains(lastCardSelectedTarget)
     ) {
-      console.log('cc-bridge: merging lastCardSelectedDetail, name=' + lastCardSelectedDetail.name);
       cardData = mergeCardSelectedDetail(cardData, lastCardSelectedDetail);
     }
 
@@ -3415,6 +3394,19 @@
           // holds) so it rides along through openEditorModal's payload
           // without adding another parameter to thread through.
           cardData.scryfallCard = scryfallCard;
+          // The queue's displayed name was set from the DOM's own
+          // data-card-name at addQueueJob time, before this lookup ever
+          // ran -- confirmed live (a printingQueue-page candidate report)
+          // that this can be wrong: ProxyPrints' own printing-tag
+          // candidate markup can carry a stale bracketed set tag baked
+          // into data-card-name (e.g. "Affectionate Indrik [FDN]") that
+          // doesn't match the candidate's actual data-card-set-code/
+          // data-card-collector-number it's attached to -- even though
+          // those two fields (which the fetch above is keyed on, not the
+          // name) correctly identified the right candidate all along.
+          // Scryfall's own name field is authoritative and carries no
+          // decoration, so once it's known, prefer it for display.
+          updateQueueJob(job.id, { cardName: scryfallCard.name });
           const isFullArt = isFullArtOrBorderless(scryfallCard);
           cardData.isFullArtFlow = isFullArt;
           const artUrl = isFullArt ? extractCardArtUrl(rootEl) : getArtCropUrl(scryfallCard);
