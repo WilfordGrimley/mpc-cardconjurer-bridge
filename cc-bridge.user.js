@@ -64,7 +64,6 @@
   const DEFAULT_DRIVE_CLIENT_ID = '794263898427-md1q1cc8qo15kq2fejr3fooi3tvqipau.apps.googleusercontent.com';
   const DEFAULT_ENABLED_ORIGINS = [
     'https://mpcfill.com',
-    'https://mpcfill.com',
     'http://localhost',
     'https://localhost',
     'http://127.0.0.1',
@@ -75,8 +74,8 @@
   const BUTTON_ANCHOR_CLASS = 'cc-bridge-btn-anchor';
   // Set alongside BUTTON_ANCHOR_CLASS specifically for the
   // nested-inside-another-button case (see createConjureTrigger) — that's
-  // the site's printing-tag candidates today, whose own hover-zoom
-  // (the hover-zoom wrapper) is a deliberate exception to how every other card
+  // some MPC Autofill sites' printing-tag candidates today, whose own
+  // hover-zoom is a deliberate exception to how every other card
   // on the site behaves (border/label static, only the art scales) —
   // the button should scale along with it there instead of staying put.
   const BUTTON_ANCHOR_ZOOM_CLASS = 'cc-bridge-btn-anchor-zoom';
@@ -121,7 +120,7 @@
   }
 
   // Google Drive export is opt-in. The OAuth connect + upload runs on the
-  // sender/mpchost page (mpcfill.com etc.), not inside the Card
+  // sender/mpchost page, not inside the Card
   // Conjurer iframe — see the "Google Drive export" section far below for
   // why. That means the Client ID's "Authorized JavaScript origins" needs
   // the *host site's* origin (e.g. https://mpcfill.com), not the CC
@@ -438,8 +437,8 @@
   // on html/.background that aren't var()-driven. Overriding just these
   // gives a complete, coherent reskin without fighting individual
   // selectors — and never touches the card canvas/rendering itself, only
-  // the surrounding application chrome. Colors are the site's real
-  // computed theme (--bs-primary/--bs-body-bg/etc.), not guessed.
+  // the surrounding application chrome. Colors are a real MPC Autofill
+  // site's computed Bootstrap theme (--bs-primary/--bs-body-bg/etc.), not guessed.
   function applyMpcfillTheme() {
     const style = document.createElement('style');
     style.textContent =
@@ -1700,8 +1699,8 @@
 
   // ---- Google Drive export (hand-off half) -------------------------------
   //
-  // The actual OAuth + upload happens on the sender/mpchost page (e.g.
-  // mpcfill.com) — see its "Google Drive export" section further down —
+  // The actual OAuth + upload happens on the sender/mpchost page —
+  // see its "Google Drive export" section further down —
   // not here. A Client ID's "Authorized JavaScript origins" list requires
   // exact domain matches, and the mpchost's own origin is a small, stable,
   // known set under this project's control; the CC origin is
@@ -1922,8 +1921,8 @@
 
   // ---- styles -------------------------------------------------------
 
-  // Colors below are the site's own real computed theme (read directly
-  // off the live site: --bs-primary/--bs-body-bg/--bs-dark/etc.), not a
+  // Colors below are a real MPC Autofill site's own computed theme (read
+  // directly off a live site: --bs-primary/--bs-body-bg/--bs-dark/etc.), not a
   // guess — the injected button and modal chrome are meant to look like
   // they belong to that page, not to Card Conjurer or to this script.
   const style = document.createElement('style');
@@ -1969,7 +1968,7 @@
     // element rather than scaling the button or anchorEl directly).
     '.' + BUTTON_TETHER_CLASS + ' {' +
     '  position: absolute; inset: 0; pointer-events: none;' +
-    // the site's the art element sets the art <img> itself to explicit
+    // Some MPC Autofill sites set the art <img> itself to an explicit
     // z-index: 1 — a sibling at the default z-index: auto (no z-index
     // set) always paints *behind* an explicit-z-index sibling regardless
     // of DOM order, so without this the wrapper (and the trigger inside
@@ -1977,13 +1976,13 @@
     // even though genuinely present in the DOM. Matches .cc-bridge-btn's
     // own z-index for consistency.
     '  z-index: 10;' +
-    // Timing matches the hover-zoom wrapper's own img transition exactly, so
+    // Timing matches the site's own hover-zoom img transition exactly, so
     // the two move in lockstep during the hover-zoom.
     '  transition: transform 0.15s ease-out;' +
     '}' +
     // Everywhere else on the site, a card's border/label stay static
-    // while only its art zooms on hover — but the site's printing-tag
-    // candidates (the hover-zoom wrapper, `:hover img { transform: scale(1.6) }`)
+    // while only its art zooms on hover — but some sites' printing-tag
+    // candidates (`:hover img { transform: scale(1.6) }`)
     // are a deliberate exception, so the trigger matches that exception
     // here rather than the site-wide norm.
     '.' + BUTTON_ANCHOR_ZOOM_CLASS + ':hover > .' + BUTTON_TETHER_CLASS + ' { transform: scale(1.6); }' +
@@ -2068,8 +2067,8 @@
 
     const data = { name: name };
 
-    // data-card-set-code / data-card-collector-number: added in the site
-    // commit , sourced from the card data model.its resolved card data — omitted
+    // data-card-set-code / data-card-collector-number: added by some MPC
+    // Autofill sites once a card's printing is resolved — omitted
     // (not emitted empty) when a card's resolved printing isn't known.
     const setCode = rootEl.getAttribute('data-card-set-code');
     if (setCode) data.set_code = setCode;
@@ -2104,10 +2103,9 @@
   //
   // Falls back to the first <img> anywhere in rootEl if img.card-img isn't
   // present — CARD_ROOT_SELECTOR's own `[data-card-name]` half also
-  // matches the site's printing-tag candidate buttons (the printing-tag candidate list/
-  // the printing-tag candidate picker's its own attribute helper), whose art is
-  // a plain <img src={candidate.smallThumbnailUrl}> with no card-img class
-  // at all, styled-components-wrapped instead of the main grid's markup.
+  // matches some sites' printing-tag candidate buttons, whose art is
+  // a plain <img src="..."> with no card-img class
+  // at all, wrapped differently than the main grid's markup.
   // Confirmed as the actual cause of a real report: a borderless card
   // (TLE 316, Sol Ring) imported with the correct frame (full_art/
   // border_color came through fine via the Scryfall fetch, independent of
@@ -2122,8 +2120,8 @@
   // ---- Scryfall lookup (see CLAUDE.md's narrow exception for this) ------
   //
   // The mpchost page has no Scryfall data at all (name/set/collector only
-  // — confirmed by reading the site's own the card data model/its serialization code code,
-  // which has no art_crop/full_art/border_color fields to give us). Card
+  // — confirmed by reading a representative site's own card-serialization
+  // code, which has no art_crop/full_art/border_color fields to give us). Card
   // Conjurer normally fetches this itself once it opens, from this exact
   // same public, unauthenticated, CORS-open endpoint — so this isn't a
   // new kind of access, just doing it a beat earlier and hand it to CC
@@ -2840,14 +2838,13 @@
     }
   }
 
-  // mpc:card-selected is real now (earlier commits),
-  // firing with a camelCase detail: {name, identifier, sourceKey, dpi,
-  // cardType, setCode, collectorNumber}. Mapped explicitly below — not a
-  // blind Object.assign — since the event's camelCase keys don't match the
-  // payload's snake_case ones.
+  // mpc:card-selected is real now, firing with a camelCase detail:
+  // {name, identifier, sourceKey, dpi, cardType, setCode, collectorNumber}.
+  // Mapped explicitly below — not a blind Object.assign — since the
+  // event's camelCase keys don't match the payload's snake_case ones.
   //
-  // Dispatched only from the project-editor grid's card component (the project-editor grid) — never
-  // from the main card component, the card-details view, or the site's printing-tag
+  // Dispatched only from the project-editor grid's own card component —
+  // never from the main grid/details views, or printing-tag
   // candidates. lastCardSelectedTarget (the event's own .target, which
   // custom events keep stable through bubbling regardless of listener
   // location) is tracked alongside the detail so handleConjureTrigger can
@@ -2902,8 +2899,8 @@
   }
 
   // A literal <button> can't validly nest inside another <button> or an
-  // <a> — some card contexts (e.g. the site's printing-tag candidates,
-  // where data-card-* attributes are spread directly onto a react-bootstrap
+  // <a> — some card contexts (e.g. printing-tag candidates on some sites,
+  // where data-card-* attributes are spread directly onto a Bootstrap-style
   // <Button>) match CARD_ROOT_SELECTOR on exactly such an element. Nesting
   // a real <button> there is invalid HTML; browsers silently reparent it
   // elsewhere in the DOM to fix that, completely decoupling its position
@@ -2931,8 +2928,8 @@
         }
       });
       // A click here would otherwise bubble into the real <button>/<a>
-      // we're nested inside — e.g. the site's printing-tag candidate
-      // buttons, whose own onClick submits a vote — and fire that too.
+      // we're nested inside — e.g. printing-tag candidate buttons on some
+      // sites, whose own onClick submits a vote — and fire that too.
       // Handled directly (not via the document-level delegated listener
       // further down, which only sees this after it's already bubbled
       // past that ancestor) so stopPropagation actually lands in time.
@@ -2969,9 +2966,9 @@
     // rootEl is whatever CARD_ROOT_SELECTOR matched, which on a grid tile
     // is the *whole* tile (header + art + name footer), on MPC Autofill's
     // card-details modal is the entire viewport-covering modal, and on
-    // the site's printing-tag candidates is the candidate's own vote
+    // some sites' printing-tag candidates is the candidate's own vote
     // <button>. The art's box (`.ratio-7x5` in the upstream/fork source,
-    // or the hover-zoom wrapper for printing-tag candidates) is sized to the
+    // or a hover-zoom wrapper for printing-tag candidates) is sized to the
     // art's own real proportions, so it — not the raw <img>, which e.g. on
     // the normal grid/details view is deliberately scaled ~9% past it to
     // preview bleed and then clipped — is exactly the art's visible
@@ -2979,7 +2976,7 @@
     // `img` fallback covers cases with no class hook, like the printing-tag
     // candidates. Falls back to rootEl if no art is found at all (e.g. it
     // hasn't rendered yet, `loading="lazy"`, or there genuinely isn't one —
-    // the site's "No match" candidate button); see upgradeButtonAnchor
+    // a site's "No match" candidate button); see upgradeButtonAnchor
     // above for how the lazy-load case gets corrected once art appears.
     const artImg = rootEl.querySelector('img.card-img') || rootEl.querySelector('img');
     const anchorEl = (artImg && artImg.parentElement) || rootEl;
@@ -3103,8 +3100,7 @@
     form.append('file', blob);
 
     // &fields=id trims Google's response to just the file id instead of
-    // the full file resource — small, free saving, matching the same call
-    // in the site's uploadFile (its own Drive upload code).
+    // the full file resource — small, free saving.
     fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', {
       method: 'POST',
       headers: { Authorization: 'Bearer ' + driveAccessToken },
@@ -3396,8 +3392,8 @@
           cardData.scryfallCard = scryfallCard;
           // The queue's displayed name was set from the DOM's own
           // data-card-name at addQueueJob time, before this lookup ever
-          // ran -- confirmed live (a printingQueue-page candidate report)
-          // that this can be wrong: the site's own printing-tag
+          // ran -- confirmed live (a real candidate-queue report)
+          // that this can be wrong: some sites' printing-tag
           // candidate markup can carry a stale bracketed set tag baked
           // into data-card-name (e.g. "Affectionate Indrik [FDN]") that
           // doesn't match the candidate's actual data-card-set-code/
@@ -3776,9 +3772,9 @@
     }, 100);
   }
 
-  // attributes: true is required, not just childList — the site omits
-  // data-card-name entirely while a card is still resolving (per its own
-  // its documented DOM API), adding it later via an attribute change on the *same* DOM
+  // attributes: true is required, not just childList — some sites omit
+  // data-card-name entirely while a card is still resolving (per the DOM
+  // API those sites document), adding it later via an attribute change on the *same* DOM
   // node rather than inserting a new one. childList alone would only ever
   // see that node once, while it's still attribute-less, and never rescan
   // it once the real data lands. attributeFilter keeps this from also
