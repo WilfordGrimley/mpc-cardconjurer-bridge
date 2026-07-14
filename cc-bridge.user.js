@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.24.0
-// @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor modal (like the card selector), auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
+// @version      0.25.0
+// @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor panel glued to the clicked card, auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
 // @grant        GM_getValue
@@ -343,9 +343,9 @@
   // wired to anything external. Rather than requiring a change to Card
   // Conjurer's source, this script drives that existing feature itself when
   // it detects it's running on the user's configured CC origin — as an
-  // iframe embedded in an in-page modal on the MPC Autofill site (see
-  // openEditorModal below), the same way MPC Autofill's own grid-selector
-  // modal works, rather than a separate browser tab. Tampermonkey/
+  // iframe embedded in an in-page panel glued directly onto the clicked
+  // card on the MPC Autofill site (see openEditorModal below), rather
+  // than a separate browser tab or centered dialog. Tampermonkey/
   // Violentmonkey run matching scripts inside iframes by default, so this
   // same script executes a second time, in the iframe's own context, once
   // its `src` navigates to the configured CC origin. Coupling to Card
@@ -480,9 +480,16 @@
     const style = document.createElement('style');
     style.textContent =
       'header, footer, .hamburger, .circle, .menu { display: none !important; }' +
+      // The embedded editor is now glued to (and sized like) the clicked
+      // card on the host page (see openEditorModal), so this whole
+      // document IS the card view: no scrolling, and the render centered
+      // in — and bounded on all sides by — the iframe viewport.
+      'html, body { margin: 0 !important; overflow: hidden !important; }' +
       '.creator-grid {' +
       '  grid-template-columns: 1fr !important; justify-items: center !important;' +
-      '  padding: 2rem 1rem !important;' +
+      '  align-content: center !important;' +
+      '  min-height: 100vh; box-sizing: border-box;' +
+      '  padding: 0 !important; margin: 0 !important;' +
       '}' +
       '.creator-menu { display: none; }' +
       '.creator-menu.cc-bridge-menu-open {' +
@@ -529,7 +536,20 @@
       '}' +
       '@keyframes cc-bridge-spin-1 { from { --cc-bridge-angle-1: 0deg; } to { --cc-bridge-angle-1: 360deg; } }' +
       '@keyframes cc-bridge-spin-2 { from { --cc-bridge-angle-2: 0deg; } to { --cc-bridge-angle-2: 360deg; } }' +
-      '.cc-bridge-portal-frame > #previewCanvas { position: relative; z-index: 1; display: block; }';
+      // Scale the render to whatever the iframe viewport is: a canvas is a
+      // replaced element with an intrinsic aspect ratio, so width/height
+      // auto under both max constraints fits it inside the viewport while
+      // keeping the card's proportions — bounded on all sides, never
+      // cropped, never scrolling. The 34px accounts for the portal frame's
+      // own 7px padding per side plus 10px of breathing room per side.
+      // !important beats both style-9.css and any inline width Card
+      // Conjurer's own code sets on the element.
+      '.cc-bridge-portal-frame > #previewCanvas {' +
+      '  position: relative; z-index: 1; display: block;' +
+      '  width: auto !important; height: auto !important;' +
+      '  max-width: calc(100vw - 34px) !important;' +
+      '  max-height: calc(100vh - 34px) !important;' +
+      '}';
     document.documentElement.appendChild(style);
 
     function wrapCanvasInPortalFrame() {
@@ -1986,26 +2006,24 @@
     // are a deliberate exception, so the trigger matches that exception
     // here rather than the site-wide norm.
     '.' + BUTTON_ANCHOR_ZOOM_CLASS + ':hover > .' + BUTTON_TETHER_CLASS + ' { transform: scale(1.6); }' +
-    '.cc-bridge-modal-backdrop {' +
-    '  position: fixed; inset: 0; background: rgba(15,37,55,0.75);' +
-    '  z-index: 999999;' +
-    '}' +
     // position/left/top/width/height are set as inline styles (see
-    // openEditorModal) and transitioned between the clicked card's own
-    // rect and the panel's full working size — position: fixed throughout
-    // both states, not just relative-then-fixed, so the transition is a
-    // smooth resize/reposition rather than a mode-switch snap.
+    // openEditorModal), tracking the clicked card's own live rect — the
+    // panel is glued to that card, not a centered dialog, so there's no
+    // dimming backdrop, the page behind stays interactive, and no CSS
+    // transition on the geometry: scroll-driven repositioning has to land
+    // the same frame as the scroll, or the panel visibly lags its card.
     '.cc-bridge-modal-panel {' +
-    '  position: fixed;' +
+    '  position: fixed; z-index: 999999;' +
     '  background: #0f2537; border-radius: 2px; overflow: hidden;' +
     '  box-shadow: 0 10px 40px rgba(0,0,0,0.5);' +
     '  border: 1px solid #20374c;' +
-    '  transition: left 0.32s cubic-bezier(0.2, 0.7, 0.3, 1), top 0.32s cubic-bezier(0.2, 0.7, 0.3, 1),' +
-    '    width 0.32s cubic-bezier(0.2, 0.7, 0.3, 1), height 0.32s cubic-bezier(0.2, 0.7, 0.3, 1);' +
     '}' +
     '.cc-bridge-modal-iframe { width: 100%; height: 100%; border: 0; display: block; }' +
+    // Top-LEFT, not top-right: the embedded Card Conjurer's own
+    // hamburger toggle (see applyPortalTheme) already occupies the
+    // panel's top-right corner, and at card size the two would overlap.
     '.cc-bridge-modal-close {' +
-    '  position: absolute; top: 8px; right: 8px; z-index: 1;' +
+    '  position: absolute; top: 8px; left: 8px; z-index: 1;' +
     '  width: 32px; height: 32px; border-radius: 50%; border: none;' +
     '  background: #4c9be8; color: #ebebeb; font-size: 18px; line-height: 1;' +
     '  cursor: pointer;' +
@@ -3260,13 +3278,19 @@
   let upscaleQueue = [];
   let activeJob = null;
 
-  function addQueueJob(cardData, originRect, runJob) {
+  function addQueueJob(cardData, originRect, originEl, runJob) {
     const job = {
       id: 'q' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
       cardName: cardData.name,
       status: 'queued', // 'queued' | 'processing' | 'ready' | 'failed'
       cardData: cardData,
       originRect: originRect,
+      // The card element itself, kept alongside the click-time rect so
+      // the editor panel can glue to the card's *live* position when the
+      // job is finally opened — possibly minutes of upscaling (and
+      // scrolling) later. openEditorModal falls back to originRect if
+      // this node has been removed by a framework re-render by then.
+      originEl: originEl,
       runJob: runJob,
       resultBlob: null,
       progressDone: 0,
@@ -3376,7 +3400,7 @@
       // which is also why the Scryfall lookup (this job doesn't even
       // know its art URL yet) has to live inside runJob rather than
       // running eagerly here.
-      addQueueJob(cardData, originRect, function (job, onProgress) {
+      addQueueJob(cardData, originRect, rootEl, function (job, onProgress) {
         fetchScryfallCard(cardData, function (scryfallCard) {
           if (!scryfallCard) {
             // No pre-fetch available (network hiccup, unknown card) — let
@@ -3432,7 +3456,7 @@
         const file = fileInput.files[0];
         fileInput.remove();
         if (!file) return;
-        addQueueJob(cardData, originRect, function (job, onProgress) {
+        addQueueJob(cardData, originRect, rootEl, function (job, onProgress) {
           upscaleViaEnlarger({ file: file }, function (blob) {
             // Fall back to the raw upload if the upscale pass didn't come
             // through — the user's own explicit choice should never just
@@ -3461,28 +3485,48 @@
   // cleanup so a second "+ conjure" click replaces rather than stacks.
   let closeCurrentModal = null;
 
-  function openEditorModal(cardData, originRect, customArtBlob) {
+  function openEditorModal(cardData, originRect, customArtBlob, originEl) {
     if (closeCurrentModal) closeCurrentModal();
 
     const ccOrigin = getCCOrigin();
 
-    const backdrop = document.createElement('div');
-    backdrop.className = 'cc-bridge-modal-backdrop';
-
     const panel = document.createElement('div');
     panel.className = 'cc-bridge-modal-panel';
 
-    // The panel is position: fixed for its entire life (see the .panel
-    // class above) — both the starting and final rects below are plain
-    // pixel values in that same coordinate space, so the CSS transition
-    // between them is a smooth resize/move rather than a layout-mode
-    // snap. Anchoring the opening rect to the card that was actually
-    // clicked reads as the editor growing out of that card, rather than
-    // an unrelated dialog appearing over the page.
-    const finalWidth = Math.min(window.innerWidth * 0.92, 1400);
-    const finalHeight = window.innerHeight * 0.92;
-    const finalLeft = (window.innerWidth - finalWidth) / 2;
-    const finalTop = (window.innerHeight - finalHeight) / 2;
+    // Glued to the clicked card: the panel sits exactly over the card
+    // element the "+ conjure" button belongs to and tracks it live
+    // through scrolls and resizes — the embedded Card Conjurer (which
+    // renders just the card, bounded by its viewport — see
+    // applyPortalTheme) appears in place of the card itself, rather than
+    // as a big centered dialog. No backdrop: the rest of the page stays
+    // scrollable and clickable while the editor is open.
+    //
+    // The live element is preferred over the rect captured at click time
+    // because the card may have scrolled (or the layout reflowed) between
+    // queueing and opening — an upscale job can take minutes. The rect is
+    // the fallback for when the element has been removed by a framework
+    // re-render: better frozen at its last known place than vanishing.
+    let lastKnownRect = originRect || null;
+
+    function currentCardRect() {
+      if (originEl && originEl.isConnected) {
+        const r = originEl.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) {
+          lastKnownRect = { left: r.left, top: r.top, width: r.width, height: r.height };
+        }
+      }
+      if (lastKnownRect) return lastKnownRect;
+      // No element and no rect (shouldn't happen — every caller captures
+      // one at click time): a small centered card-proportioned panel.
+      const w = 360;
+      const h = Math.round((w * 88) / 63); // Real card aspect ratio, 63mm × 88mm.
+      return {
+        left: (window.innerWidth - w) / 2,
+        top: (window.innerHeight - h) / 2,
+        width: w,
+        height: h,
+      };
+    }
 
     function setPanelRect(rect) {
       panel.style.left = rect.left + 'px';
@@ -3491,9 +3535,10 @@
       panel.style.height = rect.height + 'px';
     }
 
-    setPanelRect(
-      originRect || { left: finalLeft, top: finalTop, width: finalWidth, height: finalHeight }
-    );
+    function reposition() {
+      setPanelRect(currentCardRect());
+    }
+    reposition();
 
     const closeBtn = document.createElement('button');
     closeBtn.type = 'button';
@@ -3507,24 +3552,15 @@
 
     panel.appendChild(closeBtn);
     panel.appendChild(iframe);
-    backdrop.appendChild(panel);
-
-    if (originRect) {
-      // Force layout with the starting rect applied before switching to
-      // the final size, so the browser has something to transition from.
-      // eslint-disable-next-line no-unused-expressions
-      panel.getBoundingClientRect();
-      requestAnimationFrame(function () {
-        setPanelRect({ left: finalLeft, top: finalTop, width: finalWidth, height: finalHeight });
-      });
-    }
 
     let intervalId = null;
 
     function close() {
       if (intervalId) clearInterval(intervalId);
       document.removeEventListener('keydown', onKeydown);
-      if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop);
+      window.removeEventListener('scroll', reposition, true);
+      window.removeEventListener('resize', reposition);
+      if (panel.parentNode) panel.parentNode.removeChild(panel);
       if (closeCurrentModal === close) closeCurrentModal = null;
     }
     closeCurrentModal = close;
@@ -3533,11 +3569,13 @@
       if (event.key === 'Escape') close();
     }
     document.addEventListener('keydown', onKeydown);
+    // Capture phase so scrolls inside nested scroll containers (not just
+    // the document) also reposition the panel — scroll events don't
+    // bubble, but they do capture.
+    window.addEventListener('scroll', reposition, true);
+    window.addEventListener('resize', reposition);
 
     closeBtn.addEventListener('click', close);
-    backdrop.addEventListener('click', function (event) {
-      if (event.target === backdrop) close();
-    });
 
     const payload = { name: cardData.name };
     if (cardData.set_code) payload.set_code = cardData.set_code;
@@ -3569,7 +3607,7 @@
       let attempts = 0;
       intervalId = setInterval(function () {
         attempts++;
-        if (!backdrop.parentNode || attempts > MAX_RETRIES) {
+        if (!panel.parentNode || attempts > MAX_RETRIES) {
           clearInterval(intervalId);
           return;
         }
@@ -3581,7 +3619,7 @@
       }, RETRY_INTERVAL_MS);
     });
 
-    document.body.appendChild(backdrop);
+    document.body.appendChild(panel);
   }
 
   // ---- queue widget (floating, persistent, lazy) -------------------------
@@ -3731,7 +3769,7 @@
           status.textContent = QUEUE_STATUS_LABELS[job.status];
           openBtn.appendChild(status);
           openBtn.addEventListener('click', function () {
-            openEditorModal(job.cardData, job.originRect, job.resultBlob);
+            openEditorModal(job.cardData, job.originRect, job.resultBlob, job.originEl);
           });
           row.appendChild(openBtn);
         } else {
