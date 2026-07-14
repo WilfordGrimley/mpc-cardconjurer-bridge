@@ -54,6 +54,14 @@ any card-site org or repo. GPL-3.0-or-later licensed.
   only ever in direct response to that one user click. This exception
   covers Scryfall card lookups only; it does not license calls to any
   other third-party API, nor any telemetry/analytics use.
+  This also covers fetching that same resolved card's own art image (the
+  Scryfall art_crop URL, or — full-art path — the exact art the mpchost
+  page is already showing that user for that card) so it can be upscaled
+  (Enlarger) before handoff — same single click, same one card, no new
+  destination beyond wherever that art already lives. GM_xmlhttpRequest
+  (rather than a page/Worker fetch()) is used only because it's needed to
+  reliably fetch that one image regardless of the mpchost page's own CSP;
+  it does not license using GM_xmlhttpRequest for anything else.
 
 ## Local, personal, or machine-specific context
 See CLAUDE.local.md (gitignored, not tracked) for git/auth setup and
