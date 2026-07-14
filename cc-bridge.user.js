@@ -2549,7 +2549,11 @@
   const HANDOFF_IDLE_TIMEOUT_MS = 120000;
   const HANDOFF_MAX_TOTAL_MS = 20 * 60 * 1000;
 
-  function upscaleViaEnlarger(source, callback) {
+  // onProgress (optional) is invoked with {done, total} on every real
+  // enlarger-progress ping from the worker -- lets a caller (the queue
+  // widget) show live tile-by-tile status for a run that can take minutes,
+  // instead of just a generic "still working" indicator.
+  function upscaleViaEnlarger(source, callback, onProgress) {
     function sendHandoff(dataUrlOrUrl, isDataUrl) {
       const blobUrl = URL.createObjectURL(new Blob([ENLARGER_WORKER_SCRIPT], { type: 'application/javascript' }));
       const worker = new Worker(blobUrl);
@@ -2603,6 +2607,7 @@
           // extend the window rather than let a fixed deadline cut off
           // real work in progress.
           scheduleTimeout(HANDOFF_IDLE_TIMEOUT_MS);
+          if (onProgress) onProgress({ done: data.done, total: data.total });
           return;
         }
         if (data.type !== 'enlarger-result') {
@@ -2868,11 +2873,6 @@
     for (let i = 0; i < roots.length; i++) {
       injectButtonIfNeeded(roots[i]);
     }
-    // Cheap no-op once already present (guarded at the top of the
-    // function) — piggybacks on the same rescan trigger as card scanning
-    // so it retries opportunistically until the nav actually exists,
-    // without a separate observer.
-    injectQueueNavTab();
   }
 
   // ---- Google Drive export (upload half, runs on this host page) --------
@@ -3125,22 +3125,50 @@
   // need survival across a full reload/tab close, only across multiple
   // "+ conjure" clicks within the same page session, which a plain array
   // handles fine.
+  // A genuine serial queue, not just a status list: addQueueJob no longer
+  // starts work immediately, it stores a runJob function (the actual
+  // upscale-triggering work, deferred since e.g. the Scryfall-art path
+  // doesn't even know its art URL until an async Scryfall lookup resolves)
+  // and processQueue only ever runs one job at a time. Upscaling is real
+  // CPU work (WASM inference, no threading available -- see
+  // ensureOrtLoaded's numThreads=1) that can take minutes; running two of
+  // those concurrently would only make both slower, not faster, so this
+  // is a hard rule, not just a display simplification.
   let upscaleQueue = [];
-  let queueListeners = [];
+  let activeJob = null;
 
-  function addQueueJob(cardData, originRect) {
+  function addQueueJob(cardData, originRect, runJob) {
     const job = {
       id: 'q' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
       cardName: cardData.name,
       status: 'queued', // 'queued' | 'processing' | 'ready' | 'failed'
       cardData: cardData,
       originRect: originRect,
+      runJob: runJob,
       resultBlob: null,
+      progressDone: 0,
+      progressTotal: 0,
       createdAt: Date.now(),
     };
     upscaleQueue.push(job);
     notifyQueueChanged();
+    processQueue();
     return job;
+  }
+
+  // Starts the oldest still-queued job, but only if nothing else is
+  // currently processing -- the actual concurrency gate. Called after
+  // every job is added and every time one finishes, so the queue keeps
+  // draining itself without needing an external driver.
+  function processQueue() {
+    if (activeJob) return;
+    const next = upscaleQueue.find(function (j) { return j.status === 'queued'; });
+    if (!next) return;
+    activeJob = next;
+    updateQueueJob(next.id, { status: 'processing' });
+    next.runJob(next, function (progress) {
+      updateQueueJob(next.id, { progressDone: progress.done, progressTotal: progress.total });
+    });
   }
 
   function updateQueueJob(id, patch) {
@@ -3158,72 +3186,20 @@
   }
 
   function notifyQueueChanged() {
-    queueListeners.forEach(function (fn) {
-      fn(upscaleQueue);
-    });
+    renderQueueWidget();
   }
 
   // Marks a job ready (resultBlobOrFile may be null — the upscale pass
   // didn't come through, or there was nothing to upscale — Card Conjurer
-  // still opens fine either way, just without a custom art override) and
-  // raises the toast notification. The job itself stays in the queue list
-  // regardless of whether the toast gets dismissed or times out, so
-  // "summon it themselves" from the queue tab always works even if they
-  // miss the toast.
+  // still opens fine either way, just without a custom art override). The
+  // job itself stays in the queue widget regardless of whether it's ever
+  // clicked, so "summon it themselves" from there always works even if
+  // they're not watching when it finishes. Always hands off to
+  // processQueue so the next queued job (if any) starts immediately.
   function finishQueueJob(job, resultBlobOrFile) {
+    activeJob = null;
     updateQueueJob(job.id, { status: 'ready', resultBlob: resultBlobOrFile || null });
-    showQueueReadyToast(job);
-  }
-
-  function showQueueReadyToast(job) {
-    let container = document.querySelector('.cc-bridge-toast-stack');
-    if (!container) {
-      const style = document.createElement('style');
-      style.textContent =
-        '.cc-bridge-toast-stack {' +
-        '  position: fixed; bottom: 16px; right: 16px; z-index: 999999;' +
-        '  display: flex; flex-direction: column-reverse; gap: 8px; align-items: flex-end;' +
-        '}' +
-        '.cc-bridge-ready-toast {' +
-        '  font-size: 13px; padding: 10px 14px; border-radius: 2px; cursor: pointer;' +
-        '  color: #ebebeb; background: #4c9be8; max-width: 280px;' +
-        '  box-shadow: 0 4px 16px rgba(0,0,0,0.4); border: none; text-align: left;' +
-        '  font-family: inherit;' +
-        '}' +
-        '.cc-bridge-ready-toast:hover { background: #3d8cd9; }' +
-        '.cc-bridge-ready-toast .cc-bridge-toast-sub { display: block; font-size: 11px; opacity: 0.85; margin-top: 2px; }';
-      document.documentElement.appendChild(style);
-      container = document.createElement('div');
-      container.className = 'cc-bridge-toast-stack';
-      document.body.appendChild(container);
-    }
-
-    const toast = document.createElement('button');
-    toast.type = 'button';
-    toast.className = 'cc-bridge-ready-toast';
-
-    const strong = document.createElement('strong');
-    strong.textContent = job.cardName;
-    toast.appendChild(strong);
-    toast.appendChild(document.createTextNode(' is ready for Card Conjurer.'));
-
-    const sub = document.createElement('span');
-    sub.className = 'cc-bridge-toast-sub';
-    sub.textContent = 'Click to open';
-    toast.appendChild(sub);
-
-    toast.addEventListener('click', function () {
-      toast.remove();
-      openEditorModal(job.cardData, job.originRect, job.resultBlob);
-    });
-    container.appendChild(toast);
-
-    // Auto-dismiss the toast itself after a while so they don't pile up —
-    // the job stays in the queue tab (#2) regardless, so nothing is lost
-    // by missing it, just the quick-click shortcut.
-    setTimeout(function () {
-      if (toast.parentNode) toast.remove();
-    }, 12000);
+    processQueue();
   }
 
   // ---- art source choice (Scryfall vs. the user's own upload) -----------
@@ -3271,30 +3247,36 @@
     scryfallOpt.textContent = 'Use Scryfall art';
     scryfallOpt.addEventListener('click', function () {
       closeArtSourcePopover();
-      const job = addQueueJob(cardData, originRect);
-      updateQueueJob(job.id, { status: 'processing' });
-      fetchScryfallCard(cardData, function (scryfallCard) {
-        if (!scryfallCard) {
-          // No pre-fetch available (network hiccup, unknown card) — let
-          // Card Conjurer's own import + art fetch run untouched rather
-          // than falling back to the full card image (which is what
-          // caused the wrong-image bug this replaces).
-          finishQueueJob(job, null);
-          return;
-        }
-        // Stashed on cardData (same object reference the job already
-        // holds) so it rides along through openEditorModal's payload
-        // without adding another parameter to thread through.
-        cardData.scryfallCard = scryfallCard;
-        const isFullArt = isFullArtOrBorderless(scryfallCard);
-        cardData.isFullArtFlow = isFullArt;
-        const artUrl = isFullArt ? extractCardArtUrl(rootEl) : getArtCropUrl(scryfallCard);
-        if (!artUrl) {
-          finishQueueJob(job, null);
-          return;
-        }
-        upscaleViaEnlarger({ url: artUrl }, function (blob) {
-          finishQueueJob(job, blob);
+      // The actual work is deferred behind runJob -- addQueueJob just
+      // records the job; processQueue calls this only once it's this
+      // job's turn (see the serial-queue comment above addQueueJob),
+      // which is also why the Scryfall lookup (this job doesn't even
+      // know its art URL yet) has to live inside runJob rather than
+      // running eagerly here.
+      addQueueJob(cardData, originRect, function (job, onProgress) {
+        fetchScryfallCard(cardData, function (scryfallCard) {
+          if (!scryfallCard) {
+            // No pre-fetch available (network hiccup, unknown card) — let
+            // Card Conjurer's own import + art fetch run untouched rather
+            // than falling back to the full card image (which is what
+            // caused the wrong-image bug this replaces).
+            finishQueueJob(job, null);
+            return;
+          }
+          // Stashed on cardData (same object reference the job already
+          // holds) so it rides along through openEditorModal's payload
+          // without adding another parameter to thread through.
+          cardData.scryfallCard = scryfallCard;
+          const isFullArt = isFullArtOrBorderless(scryfallCard);
+          cardData.isFullArtFlow = isFullArt;
+          const artUrl = isFullArt ? extractCardArtUrl(rootEl) : getArtCropUrl(scryfallCard);
+          if (!artUrl) {
+            finishQueueJob(job, null);
+            return;
+          }
+          upscaleViaEnlarger({ url: artUrl }, function (blob) {
+            finishQueueJob(job, blob);
+          }, onProgress);
         });
       });
     });
@@ -3314,13 +3296,13 @@
         const file = fileInput.files[0];
         fileInput.remove();
         if (!file) return;
-        const job = addQueueJob(cardData, originRect);
-        updateQueueJob(job.id, { status: 'processing' });
-        upscaleViaEnlarger({ file: file }, function (blob) {
-          // Fall back to the raw upload if the upscale pass didn't come
-          // through — the user's own explicit choice should never just
-          // get silently dropped.
-          finishQueueJob(job, blob || file);
+        addQueueJob(cardData, originRect, function (job, onProgress) {
+          upscaleViaEnlarger({ file: file }, function (blob) {
+            // Fall back to the raw upload if the upscale pass didn't come
+            // through — the user's own explicit choice should never just
+            // get silently dropped.
+            finishQueueJob(job, blob || file);
+          }, onProgress);
         });
       });
       fileInput.click();
@@ -3466,152 +3448,170 @@
     document.body.appendChild(backdrop);
   }
 
-  // ---- queue nav tab (site-specific literal injection) -------------------
+  // ---- queue widget (floating, persistent, lazy) -------------------------
   //
-  // Injects a real tab into ProxyPrints' own nav, matching its real
-  // markup/classes so it's indistinguishable from a native one — confirmed
-  // directly against the live site that this survives real interactions
-  // (typing, form submission, tab switching, a full route navigation to a
-  // different page), since its nav links aren't state-driven and React
-  // never touches this container's children once mounted. This selector
-  // strategy is ProxyPrints' own real markup, not a generic pattern — a
-  // different MPC host site would need its own matching injection added
-  // here, not a change to this one.
-  function injectQueueNavTab() {
-    if (document.querySelector('.cc-bridge-queue-tab')) return;
-    const links = Array.prototype.filter.call(document.querySelectorAll('nav a'), function (a) {
-      return a.textContent.trim();
-    });
-    const referenceLink =
-      links.find(function (a) { return a.textContent.trim() === 'Editor'; }) ||
-      links.find(function (a) { return a.textContent.trim() === 'Explore'; });
-    if (!referenceLink) return; // Not a recognized nav structure — degrade silently, no tab.
-    const container = referenceLink.parentElement;
-
-    // A real href here (even "#") lets the host site's own client-side
-    // router grab the click — routers commonly delegate on a[href] at the
-    // document level, in the capture phase, ahead of our own listener on
-    // the tab — and navigate the page out from under the user (observed:
-    // the address bar gets overwritten with the site's own printing-queue
-    // route). No href at all means the router has nothing to match.
-    const tab = document.createElement('a');
-    tab.className = referenceLink.className + ' cc-bridge-queue-tab';
-    tab.setAttribute('role', 'button');
-    tab.tabIndex = 0;
-    updateQueueTabLabel(tab);
-    tab.addEventListener('click', function (event) {
-      event.preventDefault();
-      toggleQueuePanel(tab);
-    });
-    tab.addEventListener('keydown', function (event) {
-      if (event.key === 'Enter' || event.key === ' ') {
-        event.preventDefault();
-        toggleQueuePanel(tab);
-      }
-    });
-    container.appendChild(tab);
-
-    queueListeners.push(function () {
-      updateQueueTabLabel(tab);
-      renderQueuePanelIfOpen();
-    });
-  }
-
-  function updateQueueTabLabel(tab) {
-    const activeOrReady = upscaleQueue.filter(function (j) {
-      return j.status !== 'failed';
-    }).length;
-    tab.textContent = 'Queue' + (activeOrReady ? ' (' + activeOrReady + ')' : '');
-  }
-
-  let queuePanelEl = null;
-
-  function toggleQueuePanel(anchorTab) {
-    if (queuePanelEl) {
-      closeQueuePanel();
-      return;
-    }
-    openQueuePanel(anchorTab);
-  }
-
-  function openQueuePanel(anchorTab) {
-    const rect = anchorTab.getBoundingClientRect();
-    const panel = document.createElement('div');
-    panel.className = 'cc-bridge-queue-panel';
-    panel.style.top = rect.bottom + 6 + 'px';
-    panel.style.left = Math.max(4, rect.left) + 'px';
-    document.body.appendChild(panel);
-    queuePanelEl = panel;
-    renderQueuePanel();
-
-    setTimeout(function () {
-      document.addEventListener('click', onQueuePanelOutsideClick, true);
-      document.addEventListener('keydown', onQueuePanelKeydown);
-    }, 0);
-  }
-
-  function closeQueuePanel() {
-    if (queuePanelEl && queuePanelEl.parentNode) queuePanelEl.parentNode.removeChild(queuePanelEl);
-    queuePanelEl = null;
-    document.removeEventListener('click', onQueuePanelOutsideClick, true);
-    document.removeEventListener('keydown', onQueuePanelKeydown);
-  }
-
-  function onQueuePanelOutsideClick(event) {
-    if (queuePanelEl && !queuePanelEl.contains(event.target) && !event.target.closest('.cc-bridge-queue-tab')) {
-      closeQueuePanel();
-    }
-  }
-
-  function onQueuePanelKeydown(event) {
-    if (event.key === 'Escape') closeQueuePanel();
-  }
-
-  function renderQueuePanelIfOpen() {
-    if (queuePanelEl) renderQueuePanel();
-  }
-
+  // Replaces an earlier two-part design (a site-nav tab + dropdown panel,
+  // plus separate auto-dismissing "ready" toasts) with one floating panel
+  // that is the entire queue UI: it doesn't exist in the DOM at all until
+  // the first job is queued, shows a live tally and the active job's real
+  // tile progress (now that a run can take minutes, "still working" needs
+  // to be obvious, not just eventually true), and lists ready/queued jobs
+  // for later. Also sidesteps the old nav-tab approach's dependency on
+  // finding specific site nav markup at all.
   const QUEUE_STATUS_LABELS = { queued: 'Queued', processing: 'Upscaling…', ready: 'Ready', failed: 'Failed' };
 
-  function renderQueuePanel() {
-    if (!queuePanelEl) return;
-    queuePanelEl.innerHTML = '';
+  function ensureQueueWidgetStyle() {
+    if (document.querySelector('#cc-bridge-queue-widget-style')) return;
+    const style = document.createElement('style');
+    style.id = 'cc-bridge-queue-widget-style';
+    style.textContent =
+      '.cc-bridge-queue-widget {' +
+      '  position: fixed; bottom: 16px; right: 16px; z-index: 999999; width: 260px;' +
+      '  background: #23272e; color: #ebebeb; border-radius: 4px; font-family: inherit;' +
+      '  box-shadow: 0 4px 16px rgba(0,0,0,0.4); overflow: hidden;' +
+      '}' +
+      '.cc-bridge-queue-widget-header {' +
+      '  padding: 8px 12px; font-size: 12px; font-weight: 600; background: #1a1d22;' +
+      '}' +
+      '.cc-bridge-queue-widget-active { padding: 10px 12px; border-bottom: 1px solid #33383f; }' +
+      '.cc-bridge-queue-widget-active-name { font-size: 12px; margin-bottom: 6px; }' +
+      '.cc-bridge-queue-widget-bar { height: 6px; border-radius: 3px; background: #33383f; overflow: hidden; }' +
+      '.cc-bridge-queue-widget-bar-fill { height: 100%; background: #4c9be8; transition: width 0.2s ease; }' +
+      '.cc-bridge-queue-widget-bar-fill.cc-bridge-queue-widget-bar-indeterminate {' +
+      '  width: 40% !important; animation: cc-bridge-queue-widget-pulse 1.2s ease-in-out infinite;' +
+      '}' +
+      '@keyframes cc-bridge-queue-widget-pulse { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }' +
+      '.cc-bridge-queue-widget-sub { font-size: 11px; opacity: 0.75; margin-top: 4px; }' +
+      '.cc-bridge-queue-widget-row {' +
+      '  display: flex; align-items: center; gap: 6px; padding: 8px 12px; font-size: 12px;' +
+      '  border-bottom: 1px solid #33383f;' +
+      '}' +
+      '.cc-bridge-queue-widget-row:last-child { border-bottom: none; }' +
+      '.cc-bridge-queue-widget-row-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }' +
+      '.cc-bridge-queue-widget-row-status { opacity: 0.75; font-size: 11px; }' +
+      '.cc-bridge-queue-widget-row-ready {' +
+      '  cursor: pointer; background: none; border: none; color: inherit; text-align: left;' +
+      '  display: flex; align-items: center; gap: 6px; width: 100%; font-family: inherit; padding: 0;' +
+      '}' +
+      '.cc-bridge-queue-widget-row-ready:hover .cc-bridge-queue-widget-row-name { text-decoration: underline; }' +
+      '.cc-bridge-queue-widget-row-remove {' +
+      '  background: none; border: none; color: inherit; opacity: 0.6; cursor: pointer; font-size: 14px;' +
+      '  line-height: 1; padding: 0 2px;' +
+      '}' +
+      '.cc-bridge-queue-widget-row-remove:hover { opacity: 1; }';
+    document.documentElement.appendChild(style);
+  }
+
+  function ensureQueueWidget() {
+    let widget = document.querySelector('.cc-bridge-queue-widget');
+    if (widget) return widget;
+    ensureQueueWidgetStyle();
+    widget = document.createElement('div');
+    widget.className = 'cc-bridge-queue-widget';
+    document.body.appendChild(widget);
+    return widget;
+  }
+
+  // The single render entry point for the whole queue UI — called from
+  // notifyQueueChanged, so it's always in sync with upscaleQueue/activeJob
+  // without a separate listener-registration mechanism.
+  function renderQueueWidget() {
     if (upscaleQueue.length === 0) {
-      const empty = document.createElement('div');
-      empty.className = 'cc-bridge-queue-empty';
-      empty.textContent = 'No cards queued yet — pick a card and choose an art source to start one.';
-      queuePanelEl.appendChild(empty);
+      const existing = document.querySelector('.cc-bridge-queue-widget');
+      if (existing) existing.remove();
       return;
     }
+    const widget = ensureQueueWidget();
+    widget.innerHTML = '';
+
+    const queuedCount = upscaleQueue.filter(function (j) { return j.status === 'queued'; }).length;
+    const readyCount = upscaleQueue.filter(function (j) { return j.status === 'ready'; }).length;
+
+    const header = document.createElement('div');
+    header.className = 'cc-bridge-queue-widget-header';
+    const parts = [];
+    if (activeJob) parts.push('upscaling');
+    if (queuedCount) parts.push(queuedCount + ' waiting');
+    if (readyCount) parts.push(readyCount + ' ready');
+    header.textContent = 'Upscale queue' + (parts.length ? ' — ' + parts.join(', ') : '');
+    widget.appendChild(header);
+
+    if (activeJob) {
+      const row = document.createElement('div');
+      row.className = 'cc-bridge-queue-widget-active';
+
+      const name = document.createElement('div');
+      name.className = 'cc-bridge-queue-widget-active-name';
+      name.textContent = activeJob.cardName;
+      row.appendChild(name);
+
+      const bar = document.createElement('div');
+      bar.className = 'cc-bridge-queue-widget-bar';
+      const fill = document.createElement('div');
+      fill.className = 'cc-bridge-queue-widget-bar-fill';
+      if (activeJob.progressTotal > 0) {
+        const pct = Math.min(100, Math.round((activeJob.progressDone / activeJob.progressTotal) * 100));
+        fill.style.width = pct + '%';
+      } else {
+        // No tile progress yet -- cold-start phase (model fetch/load,
+        // InferenceSession creation) can itself take a while (see
+        // HANDOFF_START_TIMEOUT_MS). An indeterminate animated bar says
+        // "working" without implying a specific, unknown-at-this-point
+        // percentage.
+        fill.classList.add('cc-bridge-queue-widget-bar-indeterminate');
+      }
+      bar.appendChild(fill);
+      row.appendChild(bar);
+
+      const sub = document.createElement('div');
+      sub.className = 'cc-bridge-queue-widget-sub';
+      sub.textContent = activeJob.progressTotal > 0
+        ? 'Upscaling… tile ' + activeJob.progressDone + '/' + activeJob.progressTotal
+        : 'Starting…';
+      row.appendChild(sub);
+
+      widget.appendChild(row);
+    }
+
     upscaleQueue
+      .filter(function (j) { return j.status === 'queued' || j.status === 'ready'; })
       .slice()
       .reverse()
       .forEach(function (job) {
         const row = document.createElement('div');
-        row.className = 'cc-bridge-queue-row';
-
-        const name = document.createElement('span');
-        name.className = 'cc-bridge-queue-row-name';
-        name.textContent = job.cardName;
-        row.appendChild(name);
-
-        const status = document.createElement('span');
-        status.className = 'cc-bridge-queue-row-status cc-bridge-queue-status-' + job.status;
-        status.textContent = QUEUE_STATUS_LABELS[job.status] || job.status;
-        row.appendChild(status);
+        row.className = 'cc-bridge-queue-widget-row';
 
         if (job.status === 'ready') {
-          row.classList.add('cc-bridge-queue-row-clickable');
-          row.title = 'Open in Card Conjurer';
-          row.addEventListener('click', function () {
-            closeQueuePanel();
+          const openBtn = document.createElement('button');
+          openBtn.type = 'button';
+          openBtn.className = 'cc-bridge-queue-widget-row-ready';
+          openBtn.title = 'Open in Card Conjurer';
+          const name = document.createElement('span');
+          name.className = 'cc-bridge-queue-widget-row-name';
+          name.textContent = job.cardName;
+          openBtn.appendChild(name);
+          const status = document.createElement('span');
+          status.className = 'cc-bridge-queue-widget-row-status';
+          status.textContent = QUEUE_STATUS_LABELS[job.status];
+          openBtn.appendChild(status);
+          openBtn.addEventListener('click', function () {
             openEditorModal(job.cardData, job.originRect, job.resultBlob);
           });
+          row.appendChild(openBtn);
+        } else {
+          const name = document.createElement('span');
+          name.className = 'cc-bridge-queue-widget-row-name';
+          name.textContent = job.cardName;
+          row.appendChild(name);
+          const status = document.createElement('span');
+          status.className = 'cc-bridge-queue-widget-row-status';
+          status.textContent = QUEUE_STATUS_LABELS[job.status];
+          row.appendChild(status);
         }
 
         const removeBtn = document.createElement('button');
         removeBtn.type = 'button';
-        removeBtn.className = 'cc-bridge-queue-row-remove';
+        removeBtn.className = 'cc-bridge-queue-widget-row-remove';
         removeBtn.textContent = '×';
         removeBtn.setAttribute('aria-label', 'Remove from queue');
         removeBtn.addEventListener('click', function (event) {
@@ -3620,7 +3620,7 @@
         });
         row.appendChild(removeBtn);
 
-        queuePanelEl.appendChild(row);
+        widget.appendChild(row);
       });
   }
 
