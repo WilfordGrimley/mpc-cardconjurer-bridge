@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MPC Autofill → Card Conjurer Bridge
 // @namespace    https://github.com/WilfordGrimley/mpc-cardconjurer-bridge
-// @version      0.25.0
+// @version      0.26.0
 // @description  Adds a "+ conjure" button to MPC Autofill card grids that opens your own Card Conjurer instance in an in-page editor panel glued to the clicked card, auto-fills Card Conjurer's own card-import feature and a 1/8" bleed margin, and exports the finished card to a configured local folder (Chromium) or your browser's downloads (Firefox fallback).
 // @author       wilfordgrimley
 // @match        *://*/*
@@ -1625,10 +1625,30 @@
     return name.replace(/[\\/:*?"<>|]/g, '').trim();
   }
 
+  // Named to parse cleanly under MPC Autofill's own Google Drive scraper
+  // (verified against the live mpc-autofill backend source, not guessed:
+  // Image.unpack_name in cardpicker/sources/api.py, Tags.extract in
+  // cardpicker/tags.py, to_searchable in cardpicker/search/sanitisation.py),
+  // so an export dropped into an indexed drive needs no renaming:
+  //
+  //     Card Name (SET) {collector}.png
+  //
+  // - Content in () or [] is parsed as comma-separated tags, and
+  //   to_searchable strips ALL bracketed content from the indexed name —
+  //   the set code rides along without polluting name search.
+  // - The scraper's canonical-printing matching re-joins a tag with the
+  //   {curly-brace} collector number as "SET collector" and looks that up
+  //   against keys built with expansion_code.upper() — the filename's tag
+  //   is matched verbatim, so the set code must be uppercase here.
+  // - The collector number must come AFTER the name: a filename-leading
+  //   "{...} " is parsed as an ISO 639-1 language prefix (e.g. "{EN} ")
+  //   instead, which would silently eat it.
+  // - The collector number itself is kept exactly as Scryfall reports it
+  //   (can contain letters, ★, etc.) — canonical keys store it verbatim.
   function buildExportFilename(cardData) {
     let base = sanitizeFilename(cardData.name || 'card');
     if (cardData.set_code && cardData.collector_number) {
-      base += ' (' + cardData.set_code.toUpperCase() + '-' + cardData.collector_number + ')';
+      base += ' (' + cardData.set_code.toUpperCase() + ') {' + cardData.collector_number + '}';
     }
     return base + '.png';
   }
