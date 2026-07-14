@@ -422,7 +422,10 @@
     // separately has this script installed and visits Card Conjurer
     // directly on its own tab should see Card Conjurer's own real theme,
     // not have it silently overridden.
-    if (window.parent !== window) applyMpcfillTheme();
+    if (window.parent !== window) {
+      applyMpcfillTheme();
+      applyPortalTheme();
+    }
     setupCCReceiver();
     return;
   }
@@ -452,6 +455,130 @@
       'html { background: #0f2537 !important; }' +
       '.background { background: #0f2537 !important; }';
     document.documentElement.appendChild(style);
+  }
+
+  // Per user request: strip the embedded Card Conjurer down to just the
+  // card render, framed by an animated purple "portal" border, with every
+  // other control folded behind a new hamburger toggle. Structure below
+  // confirmed by reading the live page/stylesheet directly (creator/
+  // index.html, style-9.css), not guessed:
+  //   header + the site's own top-right hamburger/.circle/.menu (its own
+  //   site nav — Home/Card Creator/Printing Tool/etc., unrelated to the
+  //   editor's own options) + footer: all site chrome, hidden entirely.
+  //   .creator-grid > #previewCanvas (the actual card render, kept) +
+  //   .creator-menu (the Frame/Text/Art/Set Symbol/Watermark/Collector/
+  //   Import/Tutorial tabs — "the important options on the right side")
+  //   — hidden by default, shown as a floating drawer via our own new
+  //   hamburger, reusing the freed-up top-right corner the site's own
+  //   hamburger used to occupy.
+  // The animated border is two independently-rotating conic-gradients
+  // (different speed, opposite direction, different purple tones) blurred
+  // and screen-blended so they slide past and overlap each other — a
+  // first pass at "small worms... like a portal"; this is a genuinely
+  // subjective visual effect I can't preview from here, expect this to
+  // need actual live-look iteration.
+  function applyPortalTheme() {
+    const style = document.createElement('style');
+    style.textContent =
+      'header, footer, .hamburger, .circle, .menu { display: none !important; }' +
+      '.creator-grid {' +
+      '  grid-template-columns: 1fr !important; justify-items: center !important;' +
+      '  padding: 2rem 1rem !important;' +
+      '}' +
+      '.creator-menu { display: none; }' +
+      '.creator-menu.cc-bridge-menu-open {' +
+      '  display: block !important; position: fixed; top: 64px; right: 12px; bottom: 12px;' +
+      '  width: min(360px, 90vw); overflow-y: auto; z-index: 999998;' +
+      '  background: rgba(15,10,25,0.95); padding: 12px; border-radius: 6px;' +
+      '  box-shadow: 0 4px 24px rgba(0,0,0,0.6);' +
+      '}' +
+      '.cc-bridge-menu-toggle {' +
+      '  position: fixed; top: 12px; right: 12px; z-index: 999999;' +
+      '  width: 44px; height: 44px; border-radius: 4px; border: none;' +
+      '  background: rgba(20,10,30,0.7); cursor: pointer;' +
+      '  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px;' +
+      '}' +
+      '.cc-bridge-menu-toggle span {' +
+      '  display: block; width: 22px; height: 2px; background: #d8b4fe; border-radius: 1px;' +
+      '  transition: transform 0.25s ease, opacity 0.25s ease;' +
+      '}' +
+      '.cc-bridge-menu-toggle.cc-bridge-menu-toggle-open span:nth-child(1) { transform: translateY(7px) rotate(45deg); }' +
+      '.cc-bridge-menu-toggle.cc-bridge-menu-toggle-open span:nth-child(2) { opacity: 0; }' +
+      '.cc-bridge-menu-toggle.cc-bridge-menu-toggle-open span:nth-child(3) { transform: translateY(-7px) rotate(-45deg); }' +
+      '@property --cc-bridge-angle-1 { syntax: "<angle>"; inherits: false; initial-value: 0deg; }' +
+      '@property --cc-bridge-angle-2 { syntax: "<angle>"; inherits: false; initial-value: 0deg; }' +
+      '.cc-bridge-portal-frame {' +
+      '  position: relative; display: inline-block; padding: 7px; border-radius: 8px; isolation: isolate;' +
+      '}' +
+      '.cc-bridge-portal-frame::before, .cc-bridge-portal-frame::after {' +
+      '  content: ""; position: absolute; inset: 0; border-radius: inherit; z-index: -1; filter: blur(3px);' +
+      '}' +
+      '.cc-bridge-portal-frame::before {' +
+      '  --cc-bridge-angle-1: 0deg;' +
+      '  background: conic-gradient(from var(--cc-bridge-angle-1),' +
+      '    transparent 0deg, transparent 30deg, #b366ff 80deg, transparent 130deg,' +
+      '    transparent 210deg, #7c3aed 260deg, transparent 310deg, transparent 360deg);' +
+      '  animation: cc-bridge-spin-1 5.5s linear infinite;' +
+      '}' +
+      '.cc-bridge-portal-frame::after {' +
+      '  --cc-bridge-angle-2: 0deg;' +
+      '  background: conic-gradient(from var(--cc-bridge-angle-2),' +
+      '    transparent 0deg, transparent 50deg, #e9d5ff 110deg, transparent 150deg,' +
+      '    transparent 240deg, #9333ea 300deg, transparent 360deg);' +
+      '  animation: cc-bridge-spin-2 4s linear infinite reverse;' +
+      '  mix-blend-mode: screen;' +
+      '}' +
+      '@keyframes cc-bridge-spin-1 { from { --cc-bridge-angle-1: 0deg; } to { --cc-bridge-angle-1: 360deg; } }' +
+      '@keyframes cc-bridge-spin-2 { from { --cc-bridge-angle-2: 0deg; } to { --cc-bridge-angle-2: 360deg; } }' +
+      '.cc-bridge-portal-frame > #previewCanvas { position: relative; z-index: 1; display: block; }';
+    document.documentElement.appendChild(style);
+
+    function wrapCanvasInPortalFrame() {
+      const canvas = document.getElementById('previewCanvas');
+      if (!canvas || (canvas.parentElement && canvas.parentElement.classList.contains('cc-bridge-portal-frame'))) return;
+      const wrapper = document.createElement('div');
+      wrapper.className = 'cc-bridge-portal-frame';
+      canvas.parentNode.insertBefore(wrapper, canvas);
+      wrapper.appendChild(canvas);
+    }
+
+    function ensureMenuToggle() {
+      if (document.querySelector('.cc-bridge-menu-toggle')) return;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'cc-bridge-menu-toggle';
+      btn.setAttribute('aria-label', 'Show card options');
+      btn.appendChild(document.createElement('span'));
+      btn.appendChild(document.createElement('span'));
+      btn.appendChild(document.createElement('span'));
+      btn.addEventListener('click', function () {
+        const menu = document.querySelector('.creator-menu');
+        if (!menu) return;
+        const open = menu.classList.toggle('cc-bridge-menu-open');
+        btn.classList.toggle('cc-bridge-menu-toggle-open', open);
+      });
+      document.body.appendChild(btn);
+    }
+
+    // .creator-grid/#previewCanvas/.creator-menu are part of the creator
+    // tool's own htmx-loaded fragment, not present until that fragment is
+    // swapped into #content (see navigateToCardCreator's own MutationObserver
+    // for the same "wait for this page's real content to land" need).
+    function applyOnceReady() {
+      if (document.querySelector('.creator-grid')) {
+        wrapCanvasInPortalFrame();
+        ensureMenuToggle();
+        return;
+      }
+      const observer = new MutationObserver(function () {
+        if (!document.querySelector('.creator-grid')) return;
+        observer.disconnect();
+        wrapCanvasInPortalFrame();
+        ensureMenuToggle();
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+    }
+    applyOnceReady();
   }
 
   function setupCCReceiver() {
